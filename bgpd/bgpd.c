@@ -8919,7 +8919,8 @@ void bgp_init(unsigned short instance)
 		bgp_zebra_init(bm->master, instance);
 
 #ifdef ENABLE_BGP_VNC
-	vnc_zebra_init(bm->master);
+	if (!bgp_option_check(BGP_OPT_NO_ZEBRA))
+			vnc_zebra_init(bm->master);
 #endif
 
 	/* BGP VTY commands installation.  */
