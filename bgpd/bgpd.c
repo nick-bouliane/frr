@@ -8961,7 +8961,7 @@ void bgp_init(unsigned short instance)
 	bgp_clist = community_list_init();
 
 	/* BFD init */
-	if (!bgp_option_check(BGP_OPT_NO_BFD))
+	if (!bgp_option_check(BGP_OPT_NO_ZEBRA))
 		bgp_bfd_init(bm->master);
 
 	bgp_lp_vty_init();
