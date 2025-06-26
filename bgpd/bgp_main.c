@@ -537,6 +537,10 @@ int main(int argc, char **argv)
 	libagentx_init();
 	bgp_vrf_init();
 
+	/* Only initialize zebra if not --no_zebra */
+	if (!no_zebra_flag) {
+		bgp_zebra_init(bm->master, instance);
+	}
 
 #ifdef HAVE_SCRIPTING
 	bgp_script_init();

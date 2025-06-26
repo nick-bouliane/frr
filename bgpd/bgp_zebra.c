@@ -1646,6 +1646,9 @@ bgp_zebra_announce_actual(struct bgp_dest *dest, struct bgp_path_info *info,
 /* Announce all routes of a table to zebra */
 void bgp_zebra_announce_table(struct bgp *bgp, afi_t afi, safi_t safi)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	struct bgp_dest *dest;
 	struct bgp_table *table;
 	struct bgp_path_info *pi;
@@ -1686,6 +1689,9 @@ void bgp_zebra_announce_table(struct bgp *bgp, afi_t afi, safi_t safi)
 void bgp_zebra_announce_table_all_subtypes(struct bgp *bgp, afi_t afi,
 					   safi_t safi)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	struct bgp_dest *dest;
 	struct bgp_table *table;
 	struct bgp_path_info *pi;
@@ -1954,6 +1960,9 @@ void bgp_zebra_route_install(struct bgp_dest *dest, struct bgp_path_info *info,
 /* Withdraw all entries in a BGP instances RIB table from Zebra */
 void bgp_zebra_withdraw_table_all_subtypes(struct bgp *bgp, afi_t afi, safi_t safi)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	struct bgp_dest *dest;
 	struct bgp_table *table;
 	struct bgp_path_info *pi;
@@ -2319,6 +2328,9 @@ void bgp_zclient_reset(void)
 
 void bgp_zebra_update_srv6_encap_routes(struct bgp *bgp, afi_t afi, struct bgp *from_bgp, bool add)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	struct bgp_table *table;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
@@ -2357,6 +2369,9 @@ void bgp_zebra_update_srv6_encap_routes(struct bgp *bgp, afi_t afi, struct bgp *
  */
 void bgp_zebra_instance_register(struct bgp *bgp)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	/* Don't try to register if we're not connected to Zebra */
 	if (!bgp_zclient || bgp_zclient->sock < 0)
 		return;
@@ -2386,6 +2401,9 @@ void bgp_zebra_instance_register(struct bgp *bgp)
  */
 void bgp_zebra_instance_deregister(struct bgp *bgp)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	/* Don't try to deregister if we're not connected to Zebra */
 	if (bgp_zclient->sock < 0)
 		return;
@@ -2403,6 +2421,9 @@ void bgp_zebra_instance_deregister(struct bgp *bgp)
 
 void bgp_zebra_initiate_radv(struct bgp *bgp, struct peer *peer)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	uint32_t ra_interval = BGP_UNNUM_DEFAULT_RA_INTERVAL;
 
 	if (CHECK_FLAG(bgp->flags, BGP_FLAG_IPV6_NO_AUTO_RA))
@@ -2428,6 +2449,9 @@ void bgp_zebra_initiate_radv(struct bgp *bgp, struct peer *peer)
 
 void bgp_zebra_terminate_radv(struct bgp *bgp, struct peer *peer)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
+
 	/* Don't try to terminate if we're not connected to Zebra */
 	if (bgp_zclient->sock < 0)
 		return;
@@ -4045,6 +4069,8 @@ static void bgp_zebra_capabilities(struct zclient_capabilities *cap)
 
 void bgp_zebra_init(struct event_loop *master, unsigned short instance)
 {
+	if (bgp_option_check(BGP_OPT_NO_ZEBRA))
+		return;
 	zclient_num_connects = 0;
 
 	hook_register_prio(if_real, 0, bgp_ifp_create);
