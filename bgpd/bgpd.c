@@ -3950,6 +3950,9 @@ int bgp_get(struct bgp **bgp_val, as_t *as, const char *name,
 static void bgp_zclient_set_redist(afi_t afi, int type, unsigned short instance,
 				   vrf_id_t vrf_id, bool set)
 {
+	if (!bgp_zclient)
+		return;
+
 	if (instance) {
 		if (set)
 			redist_add_instance(&bgp_zclient->mi_redist[afi][type],
@@ -8912,7 +8915,8 @@ void bgp_init(unsigned short instance)
 	bgp_pthreads_init();
 
 	/* Init zebra. */
-	bgp_zebra_init(bm->master, instance);
+	if (!bgp_option_check(BGP_OPT_NO_ZEBRA))
+		bgp_zebra_init(bm->master, instance);
 
 #ifdef ENABLE_BGP_VNC
 	vnc_zebra_init(bm->master);
