@@ -67,6 +67,7 @@ struct update_subgroup;
 struct bpacket;
 struct stream_spsc_ring;
 struct bgp_pbr_config;
+struct peer_connection;
 
 /*
  * Allow the neighbor XXXX remote-as to take internal or external
@@ -116,8 +117,13 @@ enum bgp_af_index {
 #define FOREACH_SAFI(safi)                                            \
 	for (safi = SAFI_UNICAST; safi < SAFI_MAX; safi++)
 
-extern struct frr_pthread *bgp_pth_io;
+#define BGP_DEFAULT_IO_THREADS 1
+#define BGP_MAX_IO_THREADS 64
+
+extern struct frr_pthread **bgp_pth_io;
+extern unsigned int bgp_pth_io_count;
 extern struct frr_pthread *bgp_pth_ka;
+extern struct frr_pthread *bgp_io_thread(const struct peer_connection *connection);
 
 /* FIFO list for peer connections */
 PREDECL_LIST(peer_connection_fifo);
@@ -221,6 +227,7 @@ struct bgp_master {
 #define BM_DEFAULT_Q_LIMIT 10000
 	uint32_t inq_limit;
 	uint32_t outq_limit;
+	uint8_t io_threads;
 
 	struct event *t_bgp_sync_label_manager;
 	struct event *t_bgp_start_label_manager;

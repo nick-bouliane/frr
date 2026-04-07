@@ -45,7 +45,7 @@ static bool validate_header(struct peer_connection *connection);
 
 void bgp_writes_on(struct peer_connection *connection)
 {
-	struct frr_pthread *fpt = bgp_pth_io;
+	struct frr_pthread *fpt = bgp_io_thread(connection);
 
 	assert(fpt->running);
 
@@ -66,8 +66,7 @@ void bgp_writes_on(struct peer_connection *connection)
 void bgp_writes_off(struct peer_connection *connection)
 {
 	struct peer *peer = connection->peer;
-	struct frr_pthread *fpt = bgp_pth_io;
-	struct stream *s;
+	struct frr_pthread *fpt = bgp_io_thread(connection);
 
 	assert(fpt->running);
 
@@ -85,7 +84,8 @@ void bgp_writes_off(struct peer_connection *connection)
 
 void bgp_reads_on(struct peer_connection *connection)
 {
-	struct frr_pthread *fpt = bgp_pth_io;
+	struct frr_pthread *fpt = bgp_io_thread(connection);
+
 	assert(fpt->running);
 
 	assert(connection->status != Deleted);
@@ -105,7 +105,8 @@ void bgp_reads_on(struct peer_connection *connection)
 
 void bgp_reads_off(struct peer_connection *connection)
 {
-	struct frr_pthread *fpt = bgp_pth_io;
+	struct frr_pthread *fpt = bgp_io_thread(connection);
+
 	assert(fpt->running);
 
 	event_cancel_async(fpt->master, &connection->t_read, NULL);
@@ -127,18 +128,18 @@ static void bgp_process_writes(struct event *event)
 {
 	static struct peer *peer;
 	struct peer_connection *connection = EVENT_ARG(event);
+	struct event_loop *master = event->master;
 	uint16_t status;
 	bool reschedule = false;
 	bool fatal = false;
-	struct frr_pthread *fpt = bgp_pth_io;
 
 	peer = connection->peer;
 
 	if (connection->fd < 0)
 		return;
 
-	/* Anticipate rescheduling */
-	event_add_write(fpt->master, bgp_process_writes, connection, connection->fd,
+	/* Anticipate rescheduling (same I/O thread) */
+	event_add_write(master, bgp_process_writes, connection, connection->fd,
 			&connection->t_write);
 
 	/* Serialize with main-thread bgp_write_notify (peek/advance/free) so we
@@ -253,8 +254,6 @@ static void bgp_process_reads(struct event *event)
 	if (bm->terminating || connection->fd < 0)
 		return;
 
-	struct frr_pthread *fpt = bgp_pth_io;
-
 	frr_with_mutex (&connection->io_mtx) {
 		status = bgp_read(connection, &code);
 	}
@@ -312,8 +311,8 @@ done:
 	}
 
 	if (ret != -ENOMEM)
-		event_add_read(fpt->master, bgp_process_reads, connection, connection->fd,
-			       &connection->t_read);
+		event_add_read(event->master, bgp_process_reads, connection,
+			       connection->fd, &connection->t_read);
 	if (added_pkt) {
 		frr_with_mutex (&bm->peer_connection_mtx) {
 			if (!peer_connection_fifo_member(&bm->connection_fifo, connection))

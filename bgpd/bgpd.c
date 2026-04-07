@@ -85,6 +85,7 @@
 #include "stream_spsc_ring.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
+DEFINE_MTYPE_STATIC(BGPD, BGP_IO_THREADS, "BGP I/O thread pointers");
 DEFINE_QOBJ_TYPE(bgp_master);
 DEFINE_QOBJ_TYPE(bgp);
 DEFINE_QOBJ_TYPE(peer);
@@ -9050,6 +9051,7 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	bm->ip_tos = IPTOS_PREC_INTERNETCONTROL;
 	bm->inq_limit = BM_DEFAULT_Q_LIMIT;
 	bm->outq_limit = BM_DEFAULT_Q_LIMIT;
+	bm->io_threads = BGP_DEFAULT_IO_THREADS;
 	bm->t_bgp_sync_label_manager = NULL;
 	bm->t_bgp_start_label_manager = NULL;
 	bm->t_bgp_zebra_route = NULL;
@@ -9147,14 +9149,48 @@ static const struct cmd_variable_handler bgp_viewvrf_var_handlers[] = {
 	{.completions = NULL},
 };
 
-struct frr_pthread *bgp_pth_io;
+struct frr_pthread **bgp_pth_io;
+unsigned int bgp_pth_io_count;
 struct frr_pthread *bgp_pth_ka;
+
+static unsigned int bgp_io_thread_id(const struct peer_connection *connection)
+{
+	uintptr_t key;
+	uint32_t hash;
+
+	assert(bgp_pth_io_count > 0);
+
+	key = (uintptr_t)connection;
+
+	/* peer_connection pointers are naturally aligned, so the low bits alone
+	 * collapse badly for small thread counts like 2 or 4. Mix in higher bits
+	 * before the modulo so connections spread across the worker set.
+	 */
+	key >>= 4;
+	key ^= key >> 33;
+	key *= 0xff51afd7ed558ccdULL;
+	key ^= key >> 33;
+	key *= 0xc4ceb9fe1a85ec53ULL;
+	key ^= key >> 33;
+
+	hash = (uint32_t)key;
+	return hash % bgp_pth_io_count;
+}
+
+struct frr_pthread *bgp_io_thread(const struct peer_connection *connection)
+{
+	return bgp_pth_io[bgp_io_thread_id(connection)];
+}
 
 static void bgp_pthreads_init(void)
 {
 	assert(!bgp_pth_io);
+	assert(!bgp_pth_io_count);
 	assert(!bgp_pth_ka);
+}
 
+void bgp_pthreads_run(void)
+{
 	struct frr_pthread_attr io = {
 		.start = frr_pthread_attr_default.start,
 		.stop = frr_pthread_attr_default.stop,
@@ -9163,17 +9199,30 @@ static void bgp_pthreads_init(void)
 		.start = bgp_keepalives_start,
 		.stop = bgp_keepalives_stop,
 	};
-	bgp_pth_io = frr_pthread_new(&io, "BGP I/O thread", "bgpd_io");
-	bgp_pth_ka = frr_pthread_new(&ka, "BGP Keepalives thread", "bgpd_ka");
-}
+	char namebuf[32];
+	int i;
 
-void bgp_pthreads_run(void)
-{
-	frr_pthread_run(bgp_pth_io, NULL);
+	assert(!bgp_pth_io);
+	assert(!bgp_pth_io_count);
+	assert(!bgp_pth_ka);
+
+	bgp_pth_io_count = bm->io_threads;
+	bgp_pth_io = XCALLOC(MTYPE_BGP_IO_THREADS,
+			     sizeof(struct frr_pthread *) * bgp_pth_io_count);
+
+	for (i = 0; i < (int)bgp_pth_io_count; i++) {
+		snprintf(namebuf, sizeof(namebuf), "bgpd_io_%d", i);
+		bgp_pth_io[i] = frr_pthread_new(&io, "BGP I/O thread", namebuf);
+	}
+	bgp_pth_ka = frr_pthread_new(&ka, "BGP Keepalives thread", "bgpd_ka");
+
+	for (i = 0; i < (int)bgp_pth_io_count; i++)
+		frr_pthread_run(bgp_pth_io[i], NULL);
 	frr_pthread_run(bgp_pth_ka, NULL);
 
 	/* Wait until threads are ready. */
-	frr_pthread_wait_running(bgp_pth_io);
+	for (i = 0; i < (int)bgp_pth_io_count; i++)
+		frr_pthread_wait_running(bgp_pth_io[i]);
 	frr_pthread_wait_running(bgp_pth_ka);
 }
 

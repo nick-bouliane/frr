@@ -12530,6 +12530,7 @@ DEFPY(show_bgp_router,
 	if (uj) {
 		json_object_int_add(json, "bgpInputQueueLimit", bm->inq_limit);
 		json_object_int_add(json, "bgpOutputQueueLimit", bm->outq_limit);
+		json_object_int_add(json, "bgpIoThreads", bm->io_threads);
 		json_object_int_add(json, "zebraAnnounceCount",
 				    zebra_announce_count(&bm->zebra_announce_head));
 		json_object_int_add(json, "zebraAnnounceEarlyCount",
@@ -12543,6 +12544,7 @@ DEFPY(show_bgp_router,
 	} else {
 		vty_out(vty, "BGP Input Queue Limit: %d\n", bm->inq_limit);
 		vty_out(vty, "BGP Output Queue Limit: %d\n", bm->outq_limit);
+		vty_out(vty, "BGP I/O Threads: %u\n", bm->io_threads);
 		vty_out(vty, "Zebra announce queue (priority): %zu\n",
 			zebra_announce_count(&bm->zebra_announce_early_head));
 		vty_out(vty, "Zebra announce queue (normal): %zu\n",
@@ -21842,7 +21844,6 @@ DEFPY (no_bgp_outq_limit,
 
 	return CMD_SUCCESS;
 }
-
 
 /* Initialization of BGP interface. */
 static void bgp_vty_if_init(void)

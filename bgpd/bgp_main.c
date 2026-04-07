@@ -69,6 +69,7 @@ static const struct option longopts[] = { { "bgp_port", required_argument, NULL,
 					  { "skip_runas", no_argument, NULL, 'S' },
 					  { "ecmp", required_argument, NULL, 'e' },
 					  { "int_num", required_argument, NULL, 'I' },
+					  { "io-threads", required_argument, NULL, 'T' },
 					  { "no_zebra", no_argument, NULL, 'Z' },
 					  { "socket_size", required_argument, NULL, 's' },
 					  { "v6-with-v4-nexthops", no_argument, NULL, 'x' },
@@ -413,6 +414,7 @@ int main(int argc, char **argv)
 	int skip_runas = 0;
 	int instance = 0;
 	int buffer_size = BGP_SOCKET_SNDBUF_SIZE;
+	unsigned long io_threads = BGP_DEFAULT_IO_THREADS;
 	char *address;
 	struct listnode *node;
 	bool v6_with_v4_nexthops = false;
@@ -420,7 +422,7 @@ int main(int argc, char **argv)
 	addresses->cmp = (int (*)(void *, void *))strcmp;
 
 	frr_preinit(&bgpd_di, argc, argv);
-	frr_opt_add("p:l:SnZe:I:s:x" DEPRECATED_OPTIONS, longopts,
+	frr_opt_add("p:l:SnZe:I:T:s:x" DEPRECATED_OPTIONS, longopts,
 		    "  -p, --bgp_port           Set BGP listen port number (0 means do not listen).\n"
 		    "  -l, --listenon           Listen on specified address (implies -n)\n"
 		    "  -n, --no_kernel          Do not install route to kernel.\n"
@@ -428,6 +430,7 @@ int main(int argc, char **argv)
 		    "  -S, --skip_runas         Skip capabilities checks, and changing user and group IDs.\n"
 		    "  -e, --ecmp               Specify ECMP to use.\n"
 		    "  -I, --int_num            Set instance number (label-manager)\n"
+		    "  -T, --io-threads         Set BGP I/O thread count (1-64)\n"
 		    "  -s, --socket_size        Set BGP peer socket send buffer size\n"
 		    "  -x, --v6-with-v4-nexthop Allow BGP to form v6 neighbors using v4 nexthops\n");
 
@@ -489,6 +492,20 @@ int main(int argc, char **argv)
 					 "Instance %i out of range (0..%u)", instance,
 					 (unsigned short)-1);
 			break;
+		case 'T': {
+			char *endptr = NULL;
+
+			io_threads = strtoul(optarg, &endptr, 10);
+			if (endptr == optarg || *endptr != '\0'
+			    || io_threads < 1
+			    || io_threads > BGP_MAX_IO_THREADS) {
+				fprintf(stderr,
+					"BGP I/O thread count must be between 1 and %u\n",
+					BGP_MAX_IO_THREADS);
+				return 1;
+			}
+			break;
+		}
 		case 's':
 			buffer_size = atoi(optarg);
 			break;
@@ -508,6 +525,7 @@ int main(int argc, char **argv)
 	bm->startup_time = monotime(NULL);
 	bm->port = bgp_port;
 	bm->v6_with_v4_nexthops = v6_with_v4_nexthops;
+	bm->io_threads = io_threads;
 	if (bgp_port == 0)
 		bgp_option_set(BGP_OPT_NO_LISTEN);
 	if (no_fib_flag || no_zebra_flag)
