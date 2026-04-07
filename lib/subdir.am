@@ -113,6 +113,7 @@ lib_libfrr_la_SOURCES = \
 	lib/segment_routing.c \
 	lib/srcdest_table.c \
 	lib/stream.c \
+	lib/stream_spsc_ring.c \
 	lib/strformat.c \
 	lib/strlcat.c \
 	lib/strlcpy.c \

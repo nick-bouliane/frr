@@ -75,6 +75,14 @@ tests_lib_cxxcompat_SOURCES = tests/lib/cxxcompat.c
 tests_lib_cxxcompat_LDADD = $(ALL_TESTS_LDADD)
 
 
+check_PROGRAMS += tests/lib/test_stream_spsc_ring
+tests_lib_test_stream_spsc_ring_CFLAGS = $(TESTS_CFLAGS)
+tests_lib_test_stream_spsc_ring_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_lib_test_stream_spsc_ring_LDADD = $(ALL_TESTS_LDADD)
+tests_lib_test_stream_spsc_ring_SOURCES = tests/lib/test_stream_spsc_ring.c
+EXTRA_DIST += tests/lib/test_stream_spsc_ring.py
+
+
 check_PROGRAMS += tests/lib/fuzz_zlog
 tests_lib_fuzz_zlog_CFLAGS = $(TESTS_CFLAGS)
 tests_lib_fuzz_zlog_CPPFLAGS = $(TESTS_CPPFLAGS)
