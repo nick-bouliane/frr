@@ -48,6 +48,7 @@
 #include "bgpd/bgp_label.h"
 #include "bgpd/bgp_io.h"
 #include "bgpd/bgp_keepalives.h"
+#include "stream_spsc_ring.h"
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_trace.h"
 #include "bgpd/bgp_ls.h"
@@ -114,16 +115,18 @@ static void bgp_packet_add(struct peer_connection *connection,
 	uint32_t holdtime;
 	intmax_t sendholdtime;
 
-	frr_with_mutex (&connection->io_mtx) {
-		/* if the queue is empty, reset the "last OK" timestamp to
-		 * now, otherwise if we write another packet immediately
-		 * after it'll get confused
-		 */
-		if (!stream_fifo_count_safe(connection->obuf))
-			atomic_store_explicit(&connection->last_sendq_ok, monotime(NULL),
-					      memory_order_relaxed);
+	/* if the queue is empty, reset the "last OK" timestamp to
+	 * now, otherwise if we write another packet immediately
+	 * after it'll get confused
+	 */
+	if (!stream_spsc_ring_count(connection->obuf_ring))
+		atomic_store_explicit(&connection->last_sendq_ok, monotime(NULL),
+				      memory_order_relaxed);
 
-		stream_fifo_push(connection->obuf, s);
+	if (!stream_spsc_ring_push(connection->obuf_ring, s)) {
+		/* Ring full (should be rare; outq_limit check is done by caller). */
+		stream_free(s);
+		return;
 	}
 
 	delta = monotime(NULL) -
@@ -471,7 +474,7 @@ void bgp_generate_updgrp_packets(struct event *event)
 	 * let's stop adding to the outq if we are
 	 * already at the limit.
 	 */
-	if (connection->obuf->count >= bm->outq_limit) {
+	if (stream_spsc_ring_count(connection->obuf_ring) >= bm->outq_limit) {
 		bgp_write_proceed_actions(peer);
 		UNSET_FLAG(peer->sflags, PEER_STATUS_COND_ADV_PENDING);
 		return;
@@ -614,7 +617,7 @@ void bgp_generate_updgrp_packets(struct event *event)
 			bgp_packet_add(connection, peer, s);
 			bpacket_queue_advance_peer(paf);
 		}
-	} while (s && (++generated < wpq) && (connection->obuf->count <= bm->outq_limit) &&
+	} while (s && (++generated < wpq) && (stream_spsc_ring_count(connection->obuf_ring) <= bm->outq_limit) &&
 		 !event_should_yield(event));
 
 	if (generated)
@@ -732,7 +735,7 @@ void bgp_open_send(struct peer_connection *connection)
  * Writes NOTIFICATION message directly to a peer socket without waiting for
  * the I/O thread.
  *
- * There must be exactly one stream on the peer->connection->obuf FIFO, and the
+ * There must be exactly one stream on the peer->connection->obuf_ring, and the
  * data within this stream must match the format of a BGP NOTIFICATION message.
  * Transmission is best-effort.
  *
@@ -748,7 +751,7 @@ static void bgp_write_notify(struct peer_connection *connection,
 	struct stream *s;
 
 	/* There should be at least one packet. */
-	s = stream_fifo_pop(connection->obuf);
+	s = stream_spsc_ring_peek_at(connection->obuf_ring, 0);
 
 	if (!s)
 		return;
@@ -766,6 +769,7 @@ static void bgp_write_notify(struct peer_connection *connection,
 	 * to write the entire NOTIFY doesn't get different FSM treatment
 	 */
 	if (ret <= 0) {
+		stream_spsc_ring_advance(connection->obuf_ring, 1);
 		stream_free(s);
 		BGP_EVENT_ADD(connection, TCP_fatal_error);
 		return;
@@ -798,6 +802,7 @@ static void bgp_write_notify(struct peer_connection *connection,
 	 */
 	BGP_EVENT_ADD(connection, BGP_Stop);
 
+	stream_spsc_ring_advance(connection->obuf_ring, 1);
 	stream_free(s);
 }
 
@@ -981,7 +986,7 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 	bgp_packet_set_size(s);
 
 	/* wipe output buffer */
-	stream_fifo_clean(connection->obuf);
+	stream_spsc_ring_clean(connection->obuf_ring);
 
 	/*
 	 * If possible, store last packet for debugging purposes. This check is
@@ -1065,7 +1070,12 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 		peer_set_last_reset(peer, PEER_DOWN_NOTIFY_SEND);
 
 	/* Add packet to peer's output queue */
-	stream_fifo_push(connection->obuf, s);
+	if (!stream_spsc_ring_push(connection->obuf_ring, s)) {
+		zlog_err("%s failed to queue NOTIFICATION", peer->host);
+		stream_free(s);
+		BGP_EVENT_ADD(connection, TCP_fatal_error);
+		return;
+	}
 
 	/* If Graceful-Restart N-bit (Notification) is exchanged,
 	 * and it's not a Hard Reset, let's retain the routes.

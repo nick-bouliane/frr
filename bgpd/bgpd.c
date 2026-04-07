@@ -82,6 +82,7 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
+#include "stream_spsc_ring.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -1251,9 +1252,9 @@ void bgp_peer_connection_buffers_free(struct peer_connection *connection)
 			connection->ibuf = NULL;
 		}
 
-		if (connection->obuf) {
-			stream_fifo_free(connection->obuf);
-			connection->obuf = NULL;
+		if (connection->obuf_ring) {
+			stream_spsc_ring_clean(connection->obuf_ring);
+			stream_spsc_ring_free(&connection->obuf_ring);
 		}
 
 		if (connection->ibuf_work) {
@@ -1313,7 +1314,7 @@ struct peer_connection *bgp_peer_connection_new(struct peer *peer, const union s
 	connection->fd = -1;
 
 	connection->ibuf = stream_fifo_new();
-	connection->obuf = stream_fifo_new();
+	connection->obuf_ring = stream_spsc_ring_create(bm->outq_limit);
 	pthread_mutex_init(&connection->io_mtx, NULL);
 
 	/* We use a larger buffer for peer->obuf_work in the event that:

@@ -36,8 +36,8 @@ extern int bgp_io_stop(void **result, struct frr_pthread *fpt);
 /**
  * Turns on packet writing for a peer.
  *
- * After this function is called, any packets placed on connection->obuf will be
- * written to connection->fd until no more packets remain.
+ * After this function is called, any packets placed on connection->obuf_ring
+ * will be written to connection->fd until no more packets remain.
  *
  * Additionally, it becomes unsafe to perform socket actions on connection->fd.
  *
@@ -48,8 +48,8 @@ extern void bgp_writes_on(struct peer_connection *peer);
 /**
  * Turns off packet writing for a peer.
  *
- * After this function returns, packets placed on connection->obuf will not be
- * written to connection->fd by the I/O thread.
+ * After this function returns, packets placed on connection->obuf_ring will
+ * not be written to connection->fd by the I/O thread.
  *
  * After this function returns it becomes safe to perform socket actions on
  * connection->fd.

@@ -43,6 +43,7 @@
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_trace.h"
+#include "stream_spsc_ring.h"
 
 DEFINE_HOOK(peer_backward_transition, (struct peer * peer), (peer));
 DEFINE_HOOK(peer_status_changed, (struct peer * peer), (peer));
@@ -2088,8 +2089,8 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 	frr_with_mutex (&connection->io_mtx) {
 		if (connection->ibuf)
 			stream_fifo_clean(connection->ibuf);
-		if (connection->obuf)
-			stream_fifo_clean(connection->obuf);
+		if (connection->obuf_ring)
+			stream_spsc_ring_clean(connection->obuf_ring);
 
 		if (connection->ibuf_work)
 			ringbuf_wipe(connection->ibuf_work);

@@ -59,6 +59,7 @@
 #include "bgpd/bgp_updgrp.h"
 #include "bgpd/bgp_bfd.h"
 #include "bgpd/bgp_io.h"
+#include "stream_spsc_ring.h"
 #include "bgpd/bgp_evpn.h"
 #include "bgpd/bgp_evpn_vty.h"
 #include "bgpd/bgp_evpn_mh.h"
@@ -13742,17 +13743,12 @@ static int bgp_show_summary(struct vty *vty, struct bgp *bgp, int afi, int safi,
 				json_object_int_add(json_peer, "msgSent",
 						    PEER_TOTAL_TX(peer));
 
-				atomic_size_t outq_count, inq_count;
-				outq_count =
-					atomic_load_explicit(&peer->connection
-								      ->obuf
-								      ->count,
-							     memory_order_relaxed);
-				inq_count =
-					atomic_load_explicit(&peer->connection
-								      ->ibuf
-								      ->count,
-							     memory_order_relaxed);
+				size_t outq_count;
+				atomic_size_t inq_count;
+				outq_count = stream_spsc_ring_count(peer->connection->obuf_ring);
+				inq_count = atomic_load_explicit(
+					&peer->connection->ibuf->count,
+					memory_order_relaxed);
 
 				json_object_int_add(
 					json_peer, "tableVersion",
@@ -13916,17 +13912,12 @@ static int bgp_show_summary(struct vty *vty, struct bgp *bgp, int afi, int safi,
 					vty_out(vty, "%*s", max_neighbor_width - len,
 						" ");
 
-				atomic_size_t outq_count, inq_count;
-				outq_count =
-					atomic_load_explicit(&peer->connection
-								      ->obuf
-								      ->count,
-							     memory_order_relaxed);
-				inq_count =
-					atomic_load_explicit(&peer->connection
-								      ->ibuf
-								      ->count,
-							     memory_order_relaxed);
+				size_t outq_count;
+				atomic_size_t inq_count;
+				outq_count = stream_spsc_ring_count(peer->connection->obuf_ring);
+				inq_count = atomic_load_explicit(
+					&peer->connection->ibuf->count,
+					memory_order_relaxed);
 
 				vty_out(vty, "4");
 				vty_out(vty, ASN_FORMAT_SPACE(bgp->asnotation),
@@ -17027,11 +17018,12 @@ static void bgp_show_peer(struct vty *vty, struct peer *p, uint16_t sh_flags, bo
 		json_pfx_stat = json_object_new_object();
 
 		/* Packet counts. */
-		atomic_size_t outq_count, inq_count;
-		outq_count = atomic_load_explicit(&p->connection->obuf->count,
-						  memory_order_relaxed);
-		inq_count = atomic_load_explicit(&p->connection->ibuf->count,
-						 memory_order_relaxed);
+		size_t outq_count;
+		atomic_size_t inq_count;
+		outq_count = stream_spsc_ring_count(p->connection->obuf_ring);
+		inq_count = atomic_load_explicit(
+			&p->connection->ibuf->count,
+			memory_order_relaxed);
 
 		json_object_int_add(json_stat, "depthInq",
 				    (unsigned long)inq_count);
@@ -17087,14 +17079,15 @@ static void bgp_show_peer(struct vty *vty, struct peer *p, uint16_t sh_flags, bo
 		json_object_int_add(json_pfx_stat, "attributesDiscarded", p->stat_pfx_discard);
 		json_object_object_add(json_neigh, "prefixStats", json_pfx_stat);
 	} else {
-		atomic_size_t outq_count, inq_count, open_out, open_in,
+		size_t outq_count;
+		atomic_size_t inq_count, open_out, open_in,
 			notify_out, notify_in, update_out, update_in,
 			keepalive_out, keepalive_in, refresh_out, refresh_in,
 			dynamic_cap_out, dynamic_cap_in;
-		outq_count = atomic_load_explicit(&p->connection->obuf->count,
-						  memory_order_relaxed);
-		inq_count = atomic_load_explicit(&p->connection->ibuf->count,
-						 memory_order_relaxed);
+		outq_count = stream_spsc_ring_count(p->connection->obuf_ring);
+		inq_count = atomic_load_explicit(
+			&p->connection->ibuf->count,
+			memory_order_relaxed);
 		open_out = atomic_load_explicit(&p->open_out,
 						memory_order_relaxed);
 		open_in =

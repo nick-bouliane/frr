@@ -65,6 +65,7 @@ DECLARE_HOOK(bgp_hook_config_write_vrf, (struct vty *vty, struct vrf *vrf),
 
 struct update_subgroup;
 struct bpacket;
+struct stream_spsc_ring;
 struct bgp_pbr_config;
 
 /*
@@ -1473,9 +1474,9 @@ struct peer_connection {
 #define PEER_THREAD_READS_ON  (1U << 1)
 
 	/* Packet receive and send buffer. */
-	pthread_mutex_t io_mtx;	  // guards ibuf, obuf
-	struct stream_fifo *ibuf; // packets waiting to be processed
-	struct stream_fifo *obuf; // packets waiting to be written
+	pthread_mutex_t io_mtx;		 // guards ibuf, obuf_ring drain/clean
+	struct stream_fifo *ibuf;	 // packets waiting to be processed
+	struct stream_spsc_ring *obuf_ring; // packets waiting to be written
 
 	struct ringbuf *ibuf_work; // WiP buffer used by bgp_read() only
 

@@ -18,7 +18,8 @@
  * keepalives for.
  *
  * At set intervals, a BGP KEEPALIVE packet is generated and placed on
- * peer->obuf. This operation is thread-safe with respect to peer->obuf.
+ * peer->connection->obuf_ring. This operation is thread-safe with respect to
+ * peer->connection->obuf_ring.
  *
  * peer->v_keepalive determines the interval. Changing this value before
  * unregistering this peer with bgp_keepalives_off() results in undefined

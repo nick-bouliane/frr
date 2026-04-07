@@ -26,6 +26,7 @@
 #include "bgpd/bgp_packet.h"	// for bgp_notify_io_invalid...
 #include "bgpd/bgp_trace.h"	// for frrtraces
 #include "bgpd/bgpd.h"		// for peer, BGP_MARKER_SIZE, bgp_master, bm
+#include "stream_spsc_ring.h"
 /* clang-format on */
 
 /* forward declarations */
@@ -49,7 +50,7 @@ void bgp_writes_on(struct peer_connection *connection)
 	assert(fpt->running);
 
 	assert(connection->status != Deleted);
-	assert(connection->obuf);
+	assert(connection->obuf_ring);
 	assert(connection->ibuf);
 	assert(connection->ibuf_work);
 	assert(!connection->t_connect_check_r);
@@ -72,12 +73,10 @@ void bgp_writes_off(struct peer_connection *connection)
 
 	UNSET_FLAG(peer->connection->thread_flags, PEER_THREAD_WRITES_ON);
 
-	/* Clear out the write fifo */
+	/* Clear out the write ring */
 	frr_with_mutex (&connection->io_mtx) {
-		if (connection->obuf != NULL) {
-			while ((s = stream_fifo_pop(connection->obuf)) != NULL)
-				stream_free(s);
-		}
+		if (connection->obuf_ring != NULL)
+			stream_spsc_ring_clean(connection->obuf_ring);
 	}
 
 	event_cancel_async(fpt->master, &connection->t_write, NULL);
@@ -93,7 +92,7 @@ void bgp_reads_on(struct peer_connection *connection)
 	assert(connection->ibuf);
 	assert(connection->fd);
 	assert(connection->ibuf_work);
-	assert(connection->obuf);
+	assert(connection->obuf_ring);
 	assert(!connection->t_connect_check_r);
 	assert(!connection->t_connect_check_w);
 	assert(connection->fd);
@@ -142,9 +141,12 @@ static void bgp_process_writes(struct event *event)
 	event_add_write(fpt->master, bgp_process_writes, connection, connection->fd,
 			&connection->t_write);
 
+	/* Serialize with main-thread bgp_write_notify (peek/advance/free) so we
+	 * never use a stream the main thread just freed.
+	 */
 	frr_with_mutex (&connection->io_mtx) {
 		status = bgp_write(connection);
-		reschedule = (stream_fifo_head(connection->obuf) != NULL);
+		reschedule = (stream_spsc_ring_count(connection->obuf_ring) > 0);
 	}
 
 	/* no problem */
@@ -324,7 +326,7 @@ done:
 /*
  * Flush peer output buffer.
  *
- * This function pops packets off of peer->connection.obuf and writes them to
+ * This function drains packets from peer->connection.obuf_ring and writes them to
  * peer->connection.fd. The amount of packets written is equal to the minimum of
  * peer->wpkt_quanta and the number of packets on the output buffer, unless an
  * error occurs.
@@ -357,19 +359,22 @@ static uint16_t bgp_write(struct peer_connection *connection)
 	struct stream *ostreams[wpkt_quanta_old];
 	struct stream **streams = ostreams;
 	struct iovec iov[wpkt_quanta_old];
+	size_t ring_count;
 
-	s = stream_fifo_head(connection->obuf);
-
-	if (!s)
+	ring_count = stream_spsc_ring_count(connection->obuf_ring);
+	if (ring_count == 0)
 		goto done;
 
 	count = iovsz = 0;
-	while (count < wpkt_quanta_old && iovsz < array_size(iov) && s) {
+	while (count < wpkt_quanta_old && iovsz < array_size(iov) &&
+	       (unsigned int)count < ring_count) {
+		s = stream_spsc_ring_peek_at(connection->obuf_ring, count);
+		if (!s)
+			break;
 		ostreams[iovsz] = s;
 		iov[iovsz].iov_base = stream_pnt(s);
 		iov[iovsz].iov_len = STREAM_READABLE(s);
 		writenum += STREAM_READABLE(s);
-		s = s->next;
 		++iovsz;
 		++count;
 	}
@@ -425,11 +430,11 @@ static uint16_t bgp_write(struct peer_connection *connection)
 
 	} while (num != writenum);
 
-	/* Handle statistics */
-	for (unsigned int i = 0; i < total_written; i++) {
-		s = stream_fifo_pop(connection->obuf);
+	stream_spsc_ring_advance(connection->obuf_ring, total_written);
 
-		assert(s == ostreams[i]);
+	/* Handle statistics and free streams */
+	for (unsigned int i = 0; i < total_written; i++) {
+		s = ostreams[i];
 
 		/* Retrieve BGP packet type. */
 		stream_set_getp(s, BGP_MARKER_SIZE + 2);
