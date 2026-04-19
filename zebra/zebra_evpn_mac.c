@@ -357,7 +357,7 @@ static char *zebra_evpn_zebra_mac_flag_dump(struct zebra_mac *mac, char *buf,
 		return buf;
 	}
 
-	snprintfrr(buf, len, "%s%s%s%s%s%s%s%s%s%s%s%s",
+	snprintfrr(buf, len, "%s%s%s%s%s%s%s%s%s%s%s%s%s",
 		   CHECK_FLAG(mac->flags, ZEBRA_MAC_LOCAL) ? "LOC " : "",
 		   CHECK_FLAG(mac->flags, ZEBRA_MAC_REMOTE) ? "REM " : "",
 		   CHECK_FLAG(mac->flags, ZEBRA_MAC_AUTO) ? "AUTO " : "",
@@ -377,6 +377,9 @@ static char *zebra_evpn_zebra_mac_flag_dump(struct zebra_mac *mac, char *buf,
 								   : "",
 		   CHECK_FLAG(mac->flags, ZEBRA_MAC_LOCAL_INACTIVE)
 			   ? "LOC Inactive "
+			   : "",
+		   CHECK_FLAG(mac->flags, ZEBRA_MAC_SUPPRESSED_BY_REMOTE)
+			   ? "SUP_BY_REM "
 			   : "");
 	return buf;
 }
@@ -2008,6 +2011,7 @@ int zebra_evpn_mac_remote_macip_add(struct zebra_evpn *zevpn, struct zebra_vrf *
 	struct zebra_mac *mac;
 	bool old_es_present;
 	bool new_es_present;
+	bool replaced_local = false;
 
 	sticky = !!CHECK_FLAG(flags, ZEBRA_MACIP_TYPE_STICKY);
 	remote_gw = !!CHECK_FLAG(flags, ZEBRA_MACIP_TYPE_GW);
@@ -2088,6 +2092,7 @@ int zebra_evpn_mac_remote_macip_add(struct zebra_evpn *zevpn, struct zebra_vrf *
 
 		/* Remove local MAC from BGP. */
 		if (CHECK_FLAG(mac->flags, ZEBRA_MAC_LOCAL)) {
+			replaced_local = true;
 			/* force drop the sync flags */
 			old_static = zebra_evpn_mac_is_static(mac);
 			if (IS_ZEBRA_DEBUG_EVPN_MH_MAC) {
@@ -2116,6 +2121,8 @@ int zebra_evpn_mac_remote_macip_add(struct zebra_evpn *zevpn, struct zebra_vrf *
 		zebra_evpn_mac_clear_fwd_info(mac);
 		UNSET_FLAG(mac->flags, ZEBRA_MAC_ALL_LOCAL_FLAGS);
 		SET_FLAG(mac->flags, ZEBRA_MAC_REMOTE);
+		if (replaced_local)
+			SET_FLAG(mac->flags, ZEBRA_MAC_SUPPRESSED_BY_REMOTE);
 		mac->fwd_info.r_vtep_ip = *vtep_ip;
 
 		if (sticky)
@@ -2178,6 +2185,7 @@ int zebra_evpn_add_update_local_mac(struct zebra_vrf *zvrf,
 
 		mac = zebra_evpn_mac_add(zevpn, macaddr);
 		SET_FLAG(mac->flags, ZEBRA_MAC_LOCAL);
+		UNSET_FLAG(mac->flags, ZEBRA_MAC_SUPPRESSED_BY_REMOTE);
 		es_change = zebra_evpn_local_mac_update_fwd_info(mac, ifp, vid);
 		if (sticky)
 			SET_FLAG(mac->flags, ZEBRA_MAC_STICKY);
@@ -2197,6 +2205,7 @@ int zebra_evpn_add_update_local_mac(struct zebra_vrf *zvrf,
 		}
 
 		if (CHECK_FLAG(mac->flags, ZEBRA_MAC_LOCAL)) {
+			UNSET_FLAG(mac->flags, ZEBRA_MAC_SUPPRESSED_BY_REMOTE);
 			struct interface *old_ifp;
 			vlanid_t old_vid;
 			bool old_static;
@@ -2293,8 +2302,8 @@ int zebra_evpn_add_update_local_mac(struct zebra_vrf *zvrf,
 			UNSET_FLAG(mac->flags, ZEBRA_MAC_REMOTE);
 			UNSET_FLAG(mac->flags, ZEBRA_MAC_AUTO);
 			SET_FLAG(mac->flags, ZEBRA_MAC_LOCAL);
-			es_change = zebra_evpn_local_mac_update_fwd_info(mac,
-									 ifp,
+			UNSET_FLAG(mac->flags, ZEBRA_MAC_SUPPRESSED_BY_REMOTE);
+			es_change = zebra_evpn_local_mac_update_fwd_info(mac, ifp,
 									 vid);
 			if (sticky)
 				SET_FLAG(mac->flags, ZEBRA_MAC_STICKY);

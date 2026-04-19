@@ -1527,6 +1527,7 @@ void zebra_evpn_rem_macip_del(vni_t vni, const struct ethaddr *macaddr, uint16_t
 	struct zebra_ns *zns;
 	struct zebra_vxlan_vni *vnip;
 	struct zebra_vrf *zvrf;
+	struct interface *vlan_if = NULL;
 	char buf1[INET6_ADDRSTRLEN];
 
 	if (!macaddr) {
@@ -1584,6 +1585,27 @@ void zebra_evpn_rem_macip_del(vni_t vni, const struct ethaddr *macaddr, uint16_t
 	}
 
 	zvrf = zevpn->vxlan_if->vrf->info;
+
+	if (mac && CHECK_FLAG(mac->flags, ZEBRA_MAC_REMOTE)
+	    && CHECK_FLAG(mac->flags, ZEBRA_MAC_SUPPRESSED_BY_REMOTE)) {
+		if (IS_ZEBRA_DEBUG_VXLAN)
+			zlog_debug(
+				"%s: MAC %pEA (flags 0x%x) was local before remote; read kernel to restore local if still present",
+				__func__, macaddr, mac->flags);
+		macfdb_read_specific_mac(zns, zif->brslave_info.br_if, macaddr,
+					 vnip->access_vlan);
+	}
+
+	if (n && CHECK_FLAG(n->flags, ZEBRA_NEIGH_REMOTE)
+	    && CHECK_FLAG(n->flags, ZEBRA_NEIGH_SUPPRESSED_BY_REMOTE)) {
+		vlan_if = zevpn_map_to_svi(zevpn, true);
+		if (IS_ZEBRA_DEBUG_VXLAN)
+			zlog_debug(
+				"%s: Neigh %pIA (flags 0x%x) was local before remote; read kernel to restore local if still present",
+				__func__, ipaddr, n->flags);
+		if (vlan_if)
+			neigh_read_specific_ip(ipaddr, vlan_if);
+	}
 
 	/* Ignore the delete if this mac is a gateway mac-ip */
 	if (CHECK_FLAG(mac->flags, ZEBRA_MAC_LOCAL)

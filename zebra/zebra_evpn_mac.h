@@ -76,6 +76,8 @@ struct zebra_mac {
 #define ZEBRA_MAC_LOCAL_INACTIVE 0x800
 /* The MAC entry was created because of advertise_svi_mac */
 #define ZEBRA_MAC_SVI 0x1000
+/* Local MAC was suppressed due to competing remote ownership. */
+#define ZEBRA_MAC_SUPPRESSED_BY_REMOTE 0x2000
 
 #define ZEBRA_MAC_ALL_LOCAL_FLAGS (ZEBRA_MAC_LOCAL | ZEBRA_MAC_LOCAL_INACTIVE)
 #define ZEBRA_MAC_ALL_PEER_FLAGS                                               \

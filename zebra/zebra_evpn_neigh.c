@@ -971,6 +971,7 @@ void zebra_evpn_process_neigh_on_remote_mac_add(struct zebra_evpn *zevpn,
 	 */
 	for (ALL_LIST_ELEMENTS_RO(zmac->neigh_list, node, n)) {
 		if (CHECK_FLAG(n->flags, ZEBRA_NEIGH_LOCAL)) {
+			SET_FLAG(n->flags, ZEBRA_NEIGH_SUPPRESSED_BY_REMOTE);
 			if (IS_ZEBRA_NEIGH_ACTIVE(n)) {
 				ZEBRA_NEIGH_SET_INACTIVE(n);
 				n->loc_seq = 0;
@@ -1278,12 +1279,14 @@ int zebra_evpn_local_neigh_update(struct zebra_evpn *zevpn,
 
 		/* Set "local" forwarding info. */
 		SET_FLAG(n->flags, ZEBRA_NEIGH_LOCAL);
+		UNSET_FLAG(n->flags, ZEBRA_NEIGH_SUPPRESSED_BY_REMOTE);
 		n->ifindex = ifp->ifindex;
 		created = true;
 	} else {
 		n->gr_refresh_time = monotime(NULL);
 
 		if (CHECK_FLAG(n->flags, ZEBRA_NEIGH_LOCAL)) {
+			UNSET_FLAG(n->flags, ZEBRA_NEIGH_SUPPRESSED_BY_REMOTE);
 			bool mac_different;
 			bool cur_is_router;
 			bool old_local_inactive;
@@ -1435,6 +1438,7 @@ int zebra_evpn_local_neigh_update(struct zebra_evpn *zevpn,
 			vtep_ip = n->r_vtep_ip;
 			/* Mark appropriately */
 			UNSET_FLAG(n->flags, ZEBRA_NEIGH_REMOTE);
+			UNSET_FLAG(n->flags, ZEBRA_NEIGH_SUPPRESSED_BY_REMOTE);
 			memset(&n->r_vtep_ip.ip.addr, 0, sizeof(n->r_vtep_ip.ip));
 			SET_FLAG(n->flags, ZEBRA_NEIGH_LOCAL);
 			n->ifindex = ifp->ifindex;
@@ -2069,6 +2073,7 @@ void zebra_evpn_neigh_remote_macip_add(struct zebra_evpn *zevpn, struct zebra_vr
 				    zevpn, n, &mac->macaddr, seq, false))
 				return;
 			if (CHECK_FLAG(n->flags, ZEBRA_NEIGH_LOCAL)) {
+				SET_FLAG(n->flags, ZEBRA_NEIGH_SUPPRESSED_BY_REMOTE);
 				old_static = zebra_evpn_neigh_is_static(n);
 				if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH)
 					zlog_debug(
