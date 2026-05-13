@@ -1408,6 +1408,8 @@ int zebra_evpn_local_neigh_update(struct zebra_evpn *zevpn,
 			 * Neighbor has moved from remote to local. Its
 			 * MAC could have also changed as part of the move.
 			 */
+			zebra_evpn_neigh_uninstall(zevpn, n);
+
 			if (memcmp(n->emac.octet, macaddr->octet, ETH_ALEN)
 			    != 0) {
 				old_zmac = n->mac;

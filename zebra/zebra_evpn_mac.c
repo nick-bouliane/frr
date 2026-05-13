@@ -2288,6 +2288,9 @@ int zebra_evpn_add_update_local_mac(struct zebra_vrf *zvrf,
 				vtep_ip = mac->fwd_info.r_vtep_ip;
 				/* Trigger DAD for remote MAC */
 				do_dad = true;
+
+				zebra_evpn_rem_mac_uninstall(zevpn, mac,
+							     false);
 			}
 
 			UNSET_FLAG(mac->flags, ZEBRA_MAC_REMOTE);
