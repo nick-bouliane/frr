@@ -9472,6 +9472,7 @@ void bgp_init(unsigned short instance)
 	bgp_route_map_init();
 	bgp_scan_vty_init();
 	bgp_mplsvpn_init();
+	bgp_dynamic_aggr_init();
 #ifdef ENABLE_BGP_VNC
 	rfapi_init();
 #endif

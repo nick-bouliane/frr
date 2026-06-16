@@ -34,6 +34,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_conditional_adv.c \
 	bgpd/bgp_damp.c \
 	bgpd/bgp_debug.c \
+	bgpd/bgp_dynamic_aggr.c \
 	bgpd/bgp_dump.c \
 	bgpd/bgp_ecommunity.c \
 	bgpd/bgp_encap_tlv.c \
@@ -219,6 +220,7 @@ bgpd_bgpd_bmp_la_LDFLAGS = $(MODULE_LDFLAGS)
 
 clippy_scan += \
 	bgpd/bgp_bmp.c \
+	bgpd/bgp_dynamic_aggr.c \
 	bgpd/bgp_debug.c \
 	bgpd/bgp_evpn_vty.c \
 	bgpd/bgp_labelpool.c \

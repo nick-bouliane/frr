@@ -1636,6 +1636,13 @@ static struct cmd_node rpki_node = {
 	.prompt = "%s(config-rpki)# ",
 };
 
+static struct cmd_node dynaggr_node = {
+	.name = "dynamic-aggr",
+	.node = DYNAGGR_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-dynamic-aggr)# ",
+};
+
 static struct cmd_node rpki_vrf_node = {
 	.name = "rpki",
 	.node = RPKI_VRF_NODE,
@@ -5314,6 +5321,7 @@ void vtysh_init_vty(void)
 	install_node(&bgp_evpn_node);
 	install_node(&bgp_evpn_vni_node);
 	install_node(&rpki_node);
+	install_node(&dynaggr_node);
 	install_node(&bmp_node);
 	install_node(&bgp_srv6_node);
 	install_node(&bgp_ls_node);

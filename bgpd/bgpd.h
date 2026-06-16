@@ -2708,6 +2708,7 @@ extern void bgp_master_init(struct event_loop *master, const int buffer_size,
 			    struct list *addresses);
 
 extern void bgp_init(unsigned short instance);
+extern void bgp_dynamic_aggr_init(void);
 extern void bgp_pthreads_run(void);
 extern void bgp_pthreads_finish(void);
 extern void bgp_route_map_init(void);

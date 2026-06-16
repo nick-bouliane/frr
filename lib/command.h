@@ -176,6 +176,7 @@ enum node_type {
 	OPENFABRIC_NODE,	/* OpenFabric router configuration node */
 	VRRP_NODE,		 /* VRRP node */
 	BMP_NODE,		/* BMP config under router bgp */
+	DYNAGGR_NODE,		/* Dynamic aggregation config */
 	ISIS_SRV6_NODE,    /* ISIS SRv6 node */
 	ISIS_SRV6_NODE_MSD_NODE,    /* ISIS SRv6 Node MSDs node */
 	MGMTD_NODE,		 /* MGMTD node. */
