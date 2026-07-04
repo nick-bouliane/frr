@@ -76,6 +76,7 @@
 #include "bgpd/bgp_rd.h"	   /* form_auto_rd, struct prefix_rd */
 #include "bgpd/bgp_encap_types.h"  /* encode_encap_extcomm, BGP_ENCAP_TYPE_VXLAN */
 #include "bgpd/bgp_label.h"	   /* bgp_labels_intern, bgp_labels_unintern */
+#include "bgpd/bgp_attr_evpn.h"    /* bgp_attr_rmac */
 
 DEFINE_MGROUP(DYNAGGR, "Dynamic Aggregation");
 DEFINE_MTYPE_STATIC(DYNAGGR, DYNAGGR, "Dynamic aggr data");
@@ -158,6 +159,23 @@ struct global_dynaggr_bucket {
 	struct global_dynaggr_bucket *next;
 };
 
+/* Dynamic Nexthop: one T2 identity entry */
+struct dynaggr_nexthop_entry {
+	char peer_host[INET6_ADDRSTRLEN + 1]; /* peer IP string (unique key) */
+	struct in_addr vtep_ip;               /* EVPN next-hop = VTEP */
+	struct ethaddr rmac;                  /* Router MAC from extended community */
+	vni_t vni;
+	struct dynaggr_nexthop_entry *next;
+};
+
+/* Dynamic Nexthop: per-grid list of discovered T2 entries */
+struct dynaggr_nexthop_grid {
+	struct grid *grid;
+	struct dynaggr_nexthop_entry *entries;
+	uint32_t count;
+	struct dynaggr_nexthop_grid *next;
+};
+
 struct dynaggr_config {
 	uint16_t site_id;
 	uint16_t community_asn;
@@ -181,6 +199,11 @@ static struct global_dynaggr_rule *global_dynaggr_rules;
 static uint32_t num_global_dynaggr_rules;
 static struct global_dynaggr_bucket *global_dynaggr_buckets;
 static bool dynaggr_cli_installed;
+
+/* Dynamic nexthop anchor config and registry */
+static bool dynaggr_nexthop_anchor_set;
+static struct prefix dynaggr_nexthop_anchor;
+static struct dynaggr_nexthop_grid *dynaggr_nexthop_grids;
 
 static struct dynaggr_config dynaggr_cfg = {
 	.enabled = false,
@@ -1376,6 +1399,130 @@ static void global_dynaggr_update(struct bgp *bgp, const struct global_dynaggr_r
 }
 
 /* ===================================================================
+ * Dynamic Nexthop Registry
+ *
+ * When a configured anchor prefix is received as an EVPN Type-5, the
+ * module treats it as a T2 identity/liveness announcement rather than
+ * a tenant route. Per-grid lists of discovered T2 entries are maintained.
+ * =================================================================== */
+
+/*
+ * Find or create the per-grid nexthop list.
+ */
+static struct dynaggr_nexthop_grid *dynaggr_nexthop_get_grid(struct grid *grid)
+{
+	struct dynaggr_nexthop_grid *g;
+
+	for (g = dynaggr_nexthop_grids; g; g = g->next) {
+		if (g->grid == grid)
+			return g;
+	}
+
+	g = XCALLOC(MTYPE_DYNAGGR, sizeof(*g));
+	g->grid = grid;
+	g->next = dynaggr_nexthop_grids;
+	dynaggr_nexthop_grids = g;
+	return g;
+}
+
+/*
+ * Register or update a T2 entry when an anchor route is announced.
+ */
+static void dynaggr_nexthop_announce(struct bgp_path_info *route, struct grid *grid, vni_t vni)
+{
+	struct dynaggr_nexthop_grid *ng;
+	struct dynaggr_nexthop_entry *e;
+	struct ethaddr rmac;
+	bool has_rmac;
+
+	if (!route || !route->attr || !route->peer || !route->peer->host || !grid)
+		return;
+
+	ng = dynaggr_nexthop_get_grid(grid);
+	has_rmac = bgp_attr_rmac(route->attr, &rmac);
+
+	/* Update existing entry from same peer if present */
+	for (e = ng->entries; e; e = e->next) {
+		if (strcmp(e->peer_host, route->peer->host) != 0)
+			continue;
+		e->vtep_ip = route->attr->mp_nexthop_global_in;
+		e->vni = vni;
+		if (has_rmac)
+			e->rmac = rmac;
+		zlog_info("DYNAGGR: nexthop-anchor: updated T2 peer=%s vtep=%pI4 vni=%u grid=%s",
+			  e->peer_host, &e->vtep_ip, vni, grid->name);
+		return;
+	}
+
+	e = XCALLOC(MTYPE_DYNAGGR, sizeof(*e));
+	strlcpy(e->peer_host, route->peer->host, sizeof(e->peer_host));
+	e->vtep_ip = route->attr->mp_nexthop_global_in;
+	e->vni = vni;
+	if (has_rmac)
+		e->rmac = rmac;
+	e->next = ng->entries;
+	ng->entries = e;
+	ng->count++;
+	zlog_info("DYNAGGR: nexthop-anchor: registered T2 peer=%s vtep=%pI4 vni=%u grid=%s",
+		  e->peer_host, &e->vtep_ip, vni, grid->name);
+}
+
+/*
+ * Remove a T2 entry when its anchor route is withdrawn.
+ */
+static void dynaggr_nexthop_withdraw(struct bgp_path_info *route, struct grid *grid)
+{
+	struct dynaggr_nexthop_grid *ng;
+	struct dynaggr_nexthop_entry **epp;
+
+	if (!route || !route->peer || !route->peer->host || !grid)
+		return;
+
+	for (ng = dynaggr_nexthop_grids; ng; ng = ng->next) {
+		if (ng->grid != grid)
+			continue;
+		for (epp = &ng->entries; *epp; epp = &(*epp)->next) {
+			if (strcmp((*epp)->peer_host, route->peer->host) != 0)
+				continue;
+			{
+				struct dynaggr_nexthop_entry *old = *epp;
+
+				zlog_info("DYNAGGR: nexthop-anchor: removed T2 peer=%s grid=%s",
+					  old->peer_host, grid->name);
+				*epp = old->next;
+				XFREE(MTYPE_DYNAGGR, old);
+				if (ng->count > 0)
+					ng->count--;
+			}
+			return;
+		}
+	}
+}
+
+/*
+ * Free all dynamic nexthop registry state.
+ */
+static void dynaggr_nexthop_free_all(void)
+{
+	struct dynaggr_nexthop_grid *ng = dynaggr_nexthop_grids;
+
+	while (ng) {
+		struct dynaggr_nexthop_grid *next_ng = ng->next;
+		struct dynaggr_nexthop_entry *e = ng->entries;
+
+		while (e) {
+			struct dynaggr_nexthop_entry *next_e = e->next;
+
+			XFREE(MTYPE_DYNAGGR, e);
+			e = next_e;
+		}
+		XFREE(MTYPE_DYNAGGR, ng);
+		ng = next_ng;
+	}
+	dynaggr_nexthop_grids = NULL;
+}
+
+/* ===================================================================
  * Route Update Hook (Dynamic Aggregation only)
  * =================================================================== */
 
@@ -1405,7 +1552,8 @@ static int dynaggr_route_update(struct bgp *bgp, afi_t afi, safi_t safi, struct 
 	/* If EVPN became available after module load, originate static aggregates now. */
 	try_originate_static_aggregates();
 
-	if (num_scoped_dynaggr_supernets == 0 && num_global_dynaggr_rules == 0)
+	if (num_scoped_dynaggr_supernets == 0 && num_global_dynaggr_rules == 0 &&
+	    !dynaggr_nexthop_anchor_set)
 		return 0;
 
 	if (!is_announce && !is_withdraw)
@@ -1435,6 +1583,15 @@ static int dynaggr_route_update(struct bgp *bgp, afi_t afi, safi_t safi, struct 
 	vni = get_vni_from_route(route);
 	if (!vni)
 		return 0;
+
+	/* Dynamic nexthop anchor: treat matching route as T2 identity signal */
+	if (dynaggr_nexthop_anchor_set && prefix_same(&ip_pfx, &dynaggr_nexthop_anchor)) {
+		if (is_announce)
+			dynaggr_nexthop_announce(route, grid, vni);
+		else
+			dynaggr_nexthop_withdraw(route, grid);
+		return 0;
+	}
 
 	/* Dynamic aggregation: match scoped supernets */
 	for (i = 0; i < num_scoped_dynaggr_supernets; i++) {
@@ -2200,6 +2357,9 @@ static void dynaggr_clear_config_data(void)
 	dynaggr_cfg.has_site_id = false;
 	dynaggr_cfg.has_community_asn = false;
 	dynaggr_cfg.has_rd_id_base = false;
+	dynaggr_nexthop_free_all();
+	dynaggr_nexthop_anchor_set = false;
+	memset(&dynaggr_nexthop_anchor, 0, sizeof(dynaggr_nexthop_anchor));
 	dynaggr_reset_runtime_state();
 }
 
@@ -2283,6 +2443,9 @@ static int dynaggr_config_write(struct vty *vty)
 
 	for (struct global_dynaggr_rule *rule = global_dynaggr_rules; rule; rule = rule->next)
 		vty_out(vty, " dynamic-aggregate global community %s\n", rule->community_str);
+
+	if (dynaggr_nexthop_anchor_set)
+		vty_out(vty, " enable dynamic-nexthop anchor %pFX\n", &dynaggr_nexthop_anchor);
 
 	vty_out(vty, "!\n");
 	return 1;
@@ -2692,6 +2855,85 @@ static int dynaggr_late_init(struct event_loop *tm)
 	return 0;
 }
 
+/*
+ * Configure the anchor prefix used to identify T2 VTEP/RMAC announcements.
+ */
+DEFUN(dynaggr_nexthop_anchor_handler, dynaggr_nexthop_anchor_cmd,
+	  "enable dynamic-nexthop anchor A.B.C.D/M",
+	  "Enable feature\n"
+	  "Dynamic nexthop T2 registration\n"
+	  "Anchor prefix keyword\n"
+	  "IPv4 anchor prefix (reserved, never used for tenant traffic)\n")
+{
+	struct prefix prefix;
+
+	if (dynaggr_require_full_config(vty) != CMD_SUCCESS)
+		return CMD_WARNING;
+
+	if (!str2prefix(argv[3]->arg, &prefix) || prefix.family != AF_INET) {
+		vty_out(vty, "%% invalid anchor prefix\n");
+		return CMD_WARNING;
+	}
+	apply_mask(&prefix);
+	dynaggr_nexthop_anchor = prefix;
+	dynaggr_nexthop_anchor_set = true;
+	return CMD_SUCCESS;
+}
+
+/*
+ * Remove the anchor prefix configuration and clear the T2 registry.
+ */
+DEFUN(no_dynaggr_nexthop_anchor, no_dynaggr_nexthop_anchor_cmd,
+	  "no enable dynamic-nexthop anchor [A.B.C.D/M]",
+	  NO_STR
+	  "Enable feature\n"
+	  "Dynamic nexthop T2 registration\n"
+	  "Anchor prefix keyword\n"
+	  IGNORED_IN_NO_STR)
+{
+	dynaggr_nexthop_free_all();
+	dynaggr_nexthop_anchor_set = false;
+	memset(&dynaggr_nexthop_anchor, 0, sizeof(dynaggr_nexthop_anchor));
+	return CMD_SUCCESS;
+}
+
+/*
+ * Show the dynamic nexthop T2 registry per grid.
+ */
+DEFUN(show_dynamic_nexthop, show_dynamic_nexthop_cmd,
+      "show dynamic-nexthop",
+      SHOW_STR
+      "Show dynamic T2 nexthop registry\n")
+{
+	struct dynaggr_nexthop_grid *ng;
+	struct dynaggr_nexthop_entry *e;
+	char rmac_str[18];
+
+	if (!dynaggr_nexthop_anchor_set) {
+		vty_out(vty, "Dynamic nexthop anchor not configured.\n");
+		return CMD_SUCCESS;
+	}
+
+	vty_out(vty, "=== Dynamic Nexthop Registry ===\n");
+	vty_out(vty, "Anchor: %pFX\n\n", &dynaggr_nexthop_anchor);
+
+	for (ng = dynaggr_nexthop_grids; ng; ng = ng->next) {
+		vty_out(vty, "  Grid %s (%u entr%s):\n",
+			ng->grid->name, ng->count, ng->count == 1 ? "y" : "ies");
+		for (e = ng->entries; e; e = e->next) {
+			snprintf(rmac_str, sizeof(rmac_str),
+				 "%02x:%02x:%02x:%02x:%02x:%02x",
+				 e->rmac.octet[0], e->rmac.octet[1],
+				 e->rmac.octet[2], e->rmac.octet[3],
+				 e->rmac.octet[4], e->rmac.octet[5]);
+			vty_out(vty, "    peer=%-20s vtep=%-15pI4 rmac=%s vni=%u\n",
+				e->peer_host, &e->vtep_ip, rmac_str, e->vni);
+		}
+	}
+
+	return CMD_SUCCESS;
+}
+
 /* ===================================================================
 	 * Module Init
 	 * =================================================================== */
@@ -2746,6 +2988,11 @@ void bgp_dynamic_aggr_init(void)
 		install_element(CONFIG_NODE, &no_dynaggr_global_dynamic_aggregate_cmd);
 		install_element(VIEW_NODE, &show_dynamic_aggregate_cmd);
 		install_element(VIEW_NODE, &show_dynamic_aggregate_detail_cmd);
+		install_element(DYNAGGR_NODE, &dynaggr_nexthop_anchor_cmd);
+		install_element(DYNAGGR_NODE, &no_dynaggr_nexthop_anchor_cmd);
+		install_element(CONFIG_NODE, &dynaggr_nexthop_anchor_cmd);
+		install_element(CONFIG_NODE, &no_dynaggr_nexthop_anchor_cmd);
+		install_element(VIEW_NODE, &show_dynamic_nexthop_cmd);
 		dynaggr_cli_installed = true;
 	}
 
