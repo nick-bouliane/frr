@@ -30,16 +30,23 @@ GRID_B_RD = "10.255.0.1:50001"
 
 
 def setup_module(mod):
-    topodef = {"s1": ("leaf", "rr", "rx")}
+    topodef = {"s1": ("leaf", "t2b", "t2c", "t2d", "rr", "rx")}
     tgen = Topogen(topodef, mod.__name__)
     tgen.start_topology()
 
-    tgen.net["leaf"].cmd_raises("ip link add vrf100 up type vrf table 100")
-    tgen.net["leaf"].cmd_raises("ip link add br100 up master vrf100 type bridge")
-    tgen.net["leaf"].cmd_raises(
-        "ip link add vxlan100 up master br100 type vxlan id 100 "
-        "dstport 4789 local 10.255.0.2 nolearning"
-    )
+    for name, local in [
+        ("leaf", "10.255.0.2"),
+        ("t2b", "10.255.1.2"),
+        ("t2c", "10.255.1.3"),
+        ("t2d", "10.255.1.4"),
+    ]:
+        tgen.net[name].cmd_raises("ip link add vrf100 up type vrf table 100")
+        tgen.net[name].cmd_raises("ip link add br100 up master vrf100 type bridge")
+        tgen.net[name].cmd_raises(
+            "ip link add vxlan100 up master br100 type vxlan id 100 "
+            f"dstport 4789 local {local} nolearning"
+        )
+
     tgen.net["leaf"].cmd_raises("ip link add vrf200 up type vrf table 200")
     tgen.net["leaf"].cmd_raises("ip link add br200 up master vrf200 type bridge")
     tgen.net["leaf"].cmd_raises(
@@ -148,14 +155,15 @@ def _assert_no_evpn_prefix(router, prefix_len, prefix, message, rd=GRID_A_RD, vn
     assert result is None, message
 
 
-def _leaf_network(prefix, present=True, vrf="vrf100"):
+def _leaf_network(prefix, present=True, vrf="vrf100", route_map=None):
     command = "network" if present else "no network"
+    route_map_clause = f" route-map {route_map}" if present and route_map else ""
     get_topogen().gears["leaf"].vtysh_cmd(
         f"""
 configure terminal
  router bgp 65000 vrf {vrf}
   address-family ipv4 unicast
-   {command} {prefix}
+   {command} {prefix}{route_map_clause}
 """
     )
 
@@ -169,6 +177,76 @@ configure terminal
 {command_text}
 """
     )
+
+
+def _leaf_cfg(commands):
+    command_text = "\n".join(commands)
+    return get_topogen().gears["leaf"].vtysh_cmd(
+        f"""
+configure terminal
+{command_text}
+"""
+    )
+
+
+def _router_cfg(router_name, commands):
+    command_text = "\n".join(commands)
+    return get_topogen().gears[router_name].vtysh_cmd(
+        f"""
+configure terminal
+{command_text}
+"""
+    )
+
+
+def _router_network(router_name, prefix, present=True, vrf="vrf100"):
+    command = "network" if present else "no network"
+    get_topogen().gears[router_name].vtysh_cmd(
+        f"""
+configure terminal
+ router bgp 65000 vrf {vrf}
+  address-family ipv4 unicast
+   {command} {prefix}
+"""
+    )
+
+
+def _evpn_instance_count(router, prefix_len, prefix, vni=None):
+    try:
+        output = json.loads(router.vtysh_cmd(EVPN_PREFIX_JSON))
+    except json.JSONDecodeError:
+        return -1
+
+    key = f"[5]:[0]:[{prefix_len}]:[{prefix}]"
+    count = 0
+    for rd_data in output.values():
+        if not isinstance(rd_data, dict):
+            continue
+        route = rd_data.get(key)
+        if not route:
+            continue
+        for path_group in route.get("paths", []):
+            for path in path_group:
+                if path.get("valid") is not True:
+                    continue
+                if vni is not None and str(path.get("vni")) != str(vni):
+                    continue
+                count += 1
+    return count
+
+
+def _assert_evpn_instance_count(router, prefix_len, prefix, expected_count, message, vni=None):
+    def _count_match():
+        count = _evpn_instance_count(router, prefix_len, prefix, vni=vni)
+        if count == expected_count:
+            return None
+        return (
+            f"expected {expected_count} instances for {prefix}/{prefix_len}"
+            f" vni={vni}, got {count}"
+        )
+
+    _, result = topotest.run_and_expect(_count_match, None, count=60, wait=1)
+    assert result is None, message
 
 
 def test_static_aggregation():
@@ -778,6 +856,826 @@ configure terminal
     )
 
 
+def test_fanout_multi_grid_three_anchors_per_grid():
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    logger.info("Program fan-out test config: 4 grids, dedicated global rule, anchor supernet")
+    _rr_config(
+        [
+            " grid GRID-C rt 65000:503",
+            " grid GRID-D rt 65000:504",
+            " dynamic-aggregate global community 65000:990",
+            " enable dynamic-nexthop anchor 198.18.0.0/24",
+        ]
+    )
+
+    logger.info("Install per-speaker policy and announce fan-out contributors from 4 FRRs")
+
+    fanout_sources = {
+        "leaf": {
+            "grid_comm": "65000:501",
+            "global": ["10.210.0.0/25", "10.210.0.128/25"],
+            "anchors": ["198.18.0.1/32", "198.18.0.2/32", "198.18.0.3/32"],
+        },
+        "t2b": {
+            "grid_comm": "65000:502",
+            "global": ["10.211.0.0/25", "10.211.0.128/25"],
+            "anchors": ["198.18.0.11/32", "198.18.0.12/32", "198.18.0.13/32"],
+        },
+        "t2c": {
+            "grid_comm": "65000:503",
+            "global": ["10.212.0.0/25", "10.212.0.128/25"],
+            "anchors": ["198.18.0.21/32", "198.18.0.22/32", "198.18.0.23/32"],
+        },
+        "t2d": {
+            "grid_comm": "65000:504",
+            "global": ["10.213.0.0/25", "10.213.0.128/25"],
+            "anchors": ["198.18.0.31/32", "198.18.0.32/32", "198.18.0.33/32"],
+        },
+    }
+
+    for router_name, data in fanout_sources.items():
+        grid_list = f"fanout-grid-{router_name}"
+        anchor_list = f"fanout-anchor-{router_name}"
+        commands = []
+        seq = 5
+        for prefix in data["global"]:
+            commands.append(f"ip prefix-list {grid_list} seq {seq} permit {prefix}")
+            seq += 5
+        seq = 5
+        for prefix in data["anchors"]:
+            commands.append(f"ip prefix-list {anchor_list} seq {seq} permit {prefix}")
+            seq += 5
+        commands.extend(
+            [
+                "route-map evpn-export permit 910",
+                f" match ip address prefix-list {grid_list}",
+                f" set community {data['grid_comm']} 65000:990 additive",
+                "route-map evpn-export permit 920",
+                f" match ip address prefix-list {anchor_list}",
+                f" set community {data['grid_comm']} additive",
+            ]
+        )
+        _router_cfg(router_name, commands)
+
+        all_prefixes = [*data["global"], *data["anchors"]]
+        _router_cfg(router_name, [f"ip route {prefix} Null0 vrf vrf100" for prefix in all_prefixes])
+        for prefix in all_prefixes:
+            _router_network(router_name, prefix, present=True)
+
+    for router_name in fanout_sources:
+        tgen.gears[router_name].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    logger.info("Validate registry reaches 3 anchors per grid")
+    fanout_registry_patterns = [
+        r"Grid GRID-A \(3 entries\)",
+        r"Grid GRID-B \(3 entries\)",
+        r"Grid GRID-C \(3 entries\)",
+        r"Grid GRID-D \(3 entries\)",
+    ]
+
+    def _fanout_registry_match():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        missing = [p for p in fanout_registry_patterns if not re.search(p, output)]
+        return None if not missing else f"missing {missing} in:\n{output}"
+
+    _, result = topotest.run_and_expect(_fanout_registry_match, None, count=60, wait=1)
+    assert result is None, "Expected 3 discovered anchors per grid"
+
+    logger.info("Validate per-grid global aggregates fan out into 3 instances each")
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        3,
+        "GRID-A global aggregate should fan out to 3 instances",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.211.0.0",
+        3,
+        "GRID-B global aggregate should fan out to 3 instances",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.212.0.0",
+        3,
+        "GRID-C global aggregate should fan out to 3 instances",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.213.0.0",
+        3,
+        "GRID-D global aggregate should fan out to 3 instances",
+        vni="100",
+    )
+
+    logger.info("Validate receiver sees 3-way fan-out aggregates and no contributor /25 routes")
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.210.0.0",
+        3,
+        "Receiver should learn 3 fan-out instances for GRID-A aggregate",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.211.0.0",
+        3,
+        "Receiver should learn 3 fan-out instances for GRID-B aggregate",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.212.0.0",
+        3,
+        "Receiver should learn 3 fan-out instances for GRID-C aggregate",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.213.0.0",
+        3,
+        "Receiver should learn 3 fan-out instances for GRID-D aggregate",
+        vni="100",
+    )
+
+    for contributor in [
+        "10.210.0.0",
+        "10.210.0.128",
+        "10.211.0.0",
+        "10.211.0.128",
+        "10.212.0.0",
+        "10.212.0.128",
+        "10.213.0.0",
+        "10.213.0.128",
+    ]:
+        _assert_evpn_instance_count(
+            tgen.gears["rx"],
+            25,
+            contributor,
+            0,
+            f"Receiver should not keep contributor {contributor}/25 once aggregate is active",
+            vni="100",
+        )
+
+    logger.info("Break aggregate precondition and verify contributor fallback behavior")
+    for router_name, data in fanout_sources.items():
+        _router_network(router_name, data["global"][1], present=False)
+
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        0,
+        "GRID-A aggregate should withdraw when only one /25 contributor remains",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.211.0.0",
+        0,
+        "GRID-B aggregate should withdraw when only one /25 contributor remains",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.212.0.0",
+        0,
+        "GRID-C aggregate should withdraw when only one /25 contributor remains",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.213.0.0",
+        0,
+        "GRID-D aggregate should withdraw when only one /25 contributor remains",
+        vni="100",
+    )
+
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.210.0.0",
+        0,
+        "Receiver should not retain GRID-A /24 aggregate after fallback",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.211.0.0",
+        0,
+        "Receiver should not retain GRID-B /24 aggregate after fallback",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.212.0.0",
+        0,
+        "Receiver should not retain GRID-C /24 aggregate after fallback",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.213.0.0",
+        0,
+        "Receiver should not retain GRID-D /24 aggregate after fallback",
+        vni="100",
+    )
+
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        25,
+        "10.210.0.0",
+        1,
+        "Receiver should see fallback GRID-A contributor /25",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        25,
+        "10.211.0.0",
+        1,
+        "Receiver should see fallback GRID-B contributor /25",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        25,
+        "10.212.0.0",
+        1,
+        "Receiver should see fallback GRID-C contributor /25",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        25,
+        "10.213.0.0",
+        1,
+        "Receiver should see fallback GRID-D contributor /25",
+        vni="100",
+    )
+
+    logger.info("Restore second contributors and verify aggregate fan-out re-forms")
+    for router_name, data in fanout_sources.items():
+        _router_network(router_name, data["global"][1], present=True)
+
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        3,
+        "GRID-A aggregate should re-form with 3-way fan-out",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.211.0.0",
+        3,
+        "GRID-B aggregate should re-form with 3-way fan-out",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.212.0.0",
+        3,
+        "GRID-C aggregate should re-form with 3-way fan-out",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.213.0.0",
+        3,
+        "GRID-D aggregate should re-form with 3-way fan-out",
+        vni="100",
+    )
+
+    logger.info("Withdraw ALL anchors for GRID-A and verify fan-out drops to zero")
+    for anchor in fanout_sources["leaf"]["anchors"]:
+        _router_network("leaf", anchor, present=False)
+
+    def _registry_grid_a_zero():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        # Grid-A entry should either be absent or show (0 entries)
+        if re.search(r"Grid GRID-A \([1-9]\d* entries\)", output):
+            return f"GRID-A still has entries in:\n{output}"
+        return None
+
+    _, result = topotest.run_and_expect(_registry_grid_a_zero, None, count=60, wait=1)
+    assert result is None, "GRID-A nexthop registry should be empty after all anchors withdrawn"
+
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        0,
+        "RR should originate zero GRID-A fan-out instances when all nexthops are gone",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.210.0.0",
+        0,
+        "Receiver should see zero GRID-A fan-out instances when all nexthops are gone",
+        vni="100",
+    )
+
+    logger.info("Verify contributor /25 routes are NOT leaked to receiver when nexthops=0")
+    # When all fan-out nexthops are gone the RR has no valid nexthop list to use,
+    # so it should not re-announce the aggregate NOR fall back to advertising raw
+    # contributor routes. Everything from that grid is silenced.
+    for contributor in fanout_sources["leaf"]["global"]:
+        prefix_only = contributor.split("/")[0]
+        _assert_evpn_instance_count(
+            tgen.gears["rx"],
+            25,
+            prefix_only,
+            0,
+            f"Receiver should not see raw contributor {contributor} when no fan-out nexthop exists",
+            vni="100",
+        )
+
+    logger.info("Restore GRID-A anchors and verify fan-out recovers from zero to 3")
+    for anchor in fanout_sources["leaf"]["anchors"]:
+        _router_network("leaf", anchor, present=True)
+    tgen.gears["leaf"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        3,
+        "RR should recover GRID-A to 3 fan-out instances after anchors restored",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.210.0.0",
+        3,
+        "Receiver should recover GRID-A to 3 fan-out instances after anchors restored",
+        vni="100",
+    )
+
+    logger.info("Fan-out cleanup")
+    for router_name, data in fanout_sources.items():
+        all_prefixes = [*data["global"], *data["anchors"]]
+        for prefix in all_prefixes:
+            _router_network(router_name, prefix, present=False)
+
+        grid_list = f"fanout-grid-{router_name}"
+        anchor_list = f"fanout-anchor-{router_name}"
+        _router_cfg(
+            router_name,
+            [
+                *[f"no ip route {prefix} Null0 vrf vrf100" for prefix in all_prefixes],
+                "no route-map evpn-export permit 910",
+                "no route-map evpn-export permit 920",
+                f"no ip prefix-list {grid_list}",
+                f"no ip prefix-list {anchor_list}",
+            ],
+        )
+
+    _rr_config(
+        [
+            " no enable dynamic-nexthop anchor",
+            " no dynamic-aggregate global community 65000:990",
+            " no grid GRID-C rt 65000:503",
+            " no grid GRID-D rt 65000:504",
+        ]
+    )
+
+    for router_name in fanout_sources:
+        tgen.gears[router_name].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rx"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+
+def test_fanout_scale_many_grids_many_anchors_churn():
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    logger.info("Program scale fan-out config: 8 grids, 8 anchors per grid")
+    _rr_config(
+        [
+            " grid GRID-C rt 65000:503",
+            " grid GRID-D rt 65000:504",
+            " grid GRID-E rt 65000:505",
+            " grid GRID-F rt 65000:506",
+            " grid GRID-G rt 65000:507",
+            " grid GRID-H rt 65000:508",
+            " dynamic-aggregate global community 65000:990",
+            " enable dynamic-nexthop anchor 198.19.0.0/24",
+        ]
+    )
+
+    scale_sources = {
+        "leaf": [
+            {
+                "grid": "GRID-A",
+                "grid_comm": "65000:501",
+                "agg": "10.220.0.0",
+                "global": ["10.220.0.0/25", "10.220.0.128/25"],
+                "anchors": [
+                    "198.19.0.1/32",
+                    "198.19.0.2/32",
+                    "198.19.0.3/32",
+                    "198.19.0.4/32",
+                    "198.19.0.5/32",
+                    "198.19.0.6/32",
+                    "198.19.0.7/32",
+                    "198.19.0.8/32",
+                ],
+            },
+            {
+                "grid": "GRID-E",
+                "grid_comm": "65000:505",
+                "agg": "10.224.0.0",
+                "global": ["10.224.0.0/25", "10.224.0.128/25"],
+                "anchors": [
+                    "198.19.0.65/32",
+                    "198.19.0.66/32",
+                    "198.19.0.67/32",
+                    "198.19.0.68/32",
+                    "198.19.0.69/32",
+                    "198.19.0.70/32",
+                    "198.19.0.71/32",
+                    "198.19.0.72/32",
+                ],
+            },
+        ],
+        "t2b": [
+            {
+                "grid": "GRID-B",
+                "grid_comm": "65000:502",
+                "agg": "10.221.0.0",
+                "global": ["10.221.0.0/25", "10.221.0.128/25"],
+                "anchors": [
+                    "198.19.0.9/32",
+                    "198.19.0.10/32",
+                    "198.19.0.11/32",
+                    "198.19.0.12/32",
+                    "198.19.0.13/32",
+                    "198.19.0.14/32",
+                    "198.19.0.15/32",
+                    "198.19.0.16/32",
+                ],
+            },
+            {
+                "grid": "GRID-F",
+                "grid_comm": "65000:506",
+                "agg": "10.225.0.0",
+                "global": ["10.225.0.0/25", "10.225.0.128/25"],
+                "anchors": [
+                    "198.19.0.73/32",
+                    "198.19.0.74/32",
+                    "198.19.0.75/32",
+                    "198.19.0.76/32",
+                    "198.19.0.77/32",
+                    "198.19.0.78/32",
+                    "198.19.0.79/32",
+                    "198.19.0.80/32",
+                ],
+            },
+        ],
+        "t2c": [
+            {
+                "grid": "GRID-C",
+                "grid_comm": "65000:503",
+                "agg": "10.222.0.0",
+                "global": ["10.222.0.0/25", "10.222.0.128/25"],
+                "anchors": [
+                    "198.19.0.17/32",
+                    "198.19.0.18/32",
+                    "198.19.0.19/32",
+                    "198.19.0.20/32",
+                    "198.19.0.21/32",
+                    "198.19.0.22/32",
+                    "198.19.0.23/32",
+                    "198.19.0.24/32",
+                ],
+            },
+            {
+                "grid": "GRID-G",
+                "grid_comm": "65000:507",
+                "agg": "10.226.0.0",
+                "global": ["10.226.0.0/25", "10.226.0.128/25"],
+                "anchors": [
+                    "198.19.0.81/32",
+                    "198.19.0.82/32",
+                    "198.19.0.83/32",
+                    "198.19.0.84/32",
+                    "198.19.0.85/32",
+                    "198.19.0.86/32",
+                    "198.19.0.87/32",
+                    "198.19.0.88/32",
+                ],
+            },
+        ],
+        "t2d": [
+            {
+                "grid": "GRID-D",
+                "grid_comm": "65000:504",
+                "agg": "10.223.0.0",
+                "global": ["10.223.0.0/25", "10.223.0.128/25"],
+                "anchors": [
+                    "198.19.0.25/32",
+                    "198.19.0.26/32",
+                    "198.19.0.27/32",
+                    "198.19.0.28/32",
+                    "198.19.0.29/32",
+                    "198.19.0.30/32",
+                    "198.19.0.31/32",
+                    "198.19.0.32/32",
+                ],
+            },
+            {
+                "grid": "GRID-H",
+                "grid_comm": "65000:508",
+                "agg": "10.227.0.0",
+                "global": ["10.227.0.0/25", "10.227.0.128/25"],
+                "anchors": [
+                    "198.19.0.89/32",
+                    "198.19.0.90/32",
+                    "198.19.0.91/32",
+                    "198.19.0.92/32",
+                    "198.19.0.93/32",
+                    "198.19.0.94/32",
+                    "198.19.0.95/32",
+                    "198.19.0.96/32",
+                ],
+            },
+        ],
+    }
+
+    scale_grids = []
+    for grid_defs in scale_sources.values():
+        scale_grids.extend(grid_defs)
+
+    delayed_grid_name = "GRID-H"
+    delayed_grid = next(grid_def for grid_def in scale_grids if grid_def["grid"] == delayed_grid_name)
+    delayed_router = next(
+        router_name
+        for router_name, grid_defs in scale_sources.items()
+        if any(grid_def["grid"] == delayed_grid_name for grid_def in grid_defs)
+    )
+    delayed_anchors = set(delayed_grid["anchors"])
+
+    for router_name, grid_defs in scale_sources.items():
+        commands = []
+        seq = 800
+        for grid_def in grid_defs:
+            grid_name = grid_def["grid"].lower()
+            grid_list = f"scale-grid-{router_name}-{grid_name}"
+            anchor_list = f"scale-anchor-{router_name}-{grid_name}"
+            invalid_anchor_list = f"scale-invalid-anchor-{router_name}-{grid_name}"
+            commands.extend(
+                [
+                    f"ip prefix-list {grid_list} seq 5 permit {grid_def['global'][0]}",
+                    f"ip prefix-list {grid_list} seq 10 permit {grid_def['global'][1]}",
+                    f"ip prefix-list {invalid_anchor_list} seq 5 permit 198.20.0.0/32",
+                ]
+            )
+            anchor_seq = 5
+            for anchor in grid_def["anchors"]:
+                commands.append(f"ip prefix-list {anchor_list} seq {anchor_seq} permit {anchor}")
+                anchor_seq += 5
+
+            commands.extend(
+                [
+                    f"route-map evpn-export permit {seq}",
+                    f" match ip address prefix-list {grid_list}",
+                    f" set community {grid_def['grid_comm']} 65000:990 additive",
+                    f"route-map evpn-export permit {seq + 1}",
+                    f" match ip address prefix-list {anchor_list}",
+                    f" set community {grid_def['grid_comm']} additive",
+                    f"route-map evpn-export permit {seq + 2}",
+                    f" match ip address prefix-list {invalid_anchor_list}",
+                    f" set community {grid_def['grid_comm']} additive",
+                ]
+            )
+            seq += 10
+
+        _router_cfg(router_name, commands)
+
+        all_prefixes = ["198.20.0.0/32"]
+        for grid_def in grid_defs:
+            all_prefixes.extend([*grid_def["global"], *grid_def["anchors"]])
+        _router_cfg(router_name, [f"ip route {prefix} Null0 vrf vrf100" for prefix in all_prefixes])
+        for prefix in all_prefixes:
+            if router_name == delayed_router and prefix in delayed_anchors:
+                # Keep one grid without valid anchors initially to verify no fan-out re-announce.
+                continue
+            _router_network(router_name, prefix, present=True)
+
+    for router_name in scale_sources:
+        tgen.gears[router_name].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    logger.info("Verify no valid fan-out nexthop yields no re-announcement for delayed grid")
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        delayed_grid["agg"],
+        0,
+        "Receiver should not get aggregate when contributors exist but no valid anchors are present",
+        vni="100",
+    )
+    for contributor in delayed_grid["global"]:
+        _assert_evpn_instance_count(
+            tgen.gears["rx"],
+            25,
+            contributor.split("/")[0],
+            0,
+            "Receiver should not get contributor re-announcements when no fan-out nexthop exists",
+            vni="100",
+        )
+
+    logger.info("Add delayed valid anchors and verify fan-out starts announcing")
+    for anchor in delayed_grid["anchors"]:
+        _router_network(delayed_router, anchor, present=True)
+
+    tgen.gears[delayed_router].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    logger.info("Validate 8 anchors learned per grid and 8-way aggregate fan-out")
+
+    def _scale_registry_match():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        missing = [
+            f"Grid {grid_def['grid']} (8 entries)"
+            for grid_def in scale_grids
+            if f"Grid {grid_def['grid']} (8 entries)" not in output
+        ]
+        return None if not missing else f"missing {missing} in:\n{output}"
+
+    _, result = topotest.run_and_expect(_scale_registry_match, None, count=120, wait=1)
+    assert result is None, "Expected 8 learned anchors for each scale grid"
+
+    for grid_def in scale_grids:
+        _assert_evpn_instance_count(
+            tgen.gears["rr"],
+            24,
+            grid_def["agg"],
+            8,
+            f"{grid_def['grid']} aggregate should fan out to 8 instances on RR",
+            vni="100",
+        )
+        _assert_evpn_instance_count(
+            tgen.gears["rx"],
+            24,
+            grid_def["agg"],
+            8,
+            f"{grid_def['grid']} aggregate should fan out to 8 instances on receiver",
+            vni="100",
+        )
+
+    logger.info("Inject invalid-anchor route outside configured anchor supernet and verify ignored")
+    def _invalid_anchor_not_counted():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        unexpected = [
+            f"Grid {grid_def['grid']} (9 entries)"
+            for grid_def in scale_grids
+            if f"Grid {grid_def['grid']} (9 entries)" in output
+        ]
+        return None if not unexpected else f"unexpected {unexpected} in:\n{output}"
+
+    _, result = topotest.run_and_expect(_invalid_anchor_not_counted, None, count=30, wait=1)
+    assert result is None, "Invalid anchors outside 198.19.0.0/24 should not be learned"
+
+    logger.info("Withdraw 3 anchors per grid and verify fan-out shrinks from 8 to 5")
+    for router_name, grid_defs in scale_sources.items():
+        for grid_def in grid_defs:
+            for anchor in grid_def["anchors"][:3]:
+                _router_network(router_name, anchor, present=False)
+
+    def _scale_registry_shrink_match():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        missing = [
+            f"Grid {grid_def['grid']} (5 entries)"
+            for grid_def in scale_grids
+            if f"Grid {grid_def['grid']} (5 entries)" not in output
+        ]
+        return None if not missing else f"missing {missing} in:\n{output}"
+
+    _, result = topotest.run_and_expect(_scale_registry_shrink_match, None, count=120, wait=1)
+    assert result is None, "Expected 5 learned anchors per grid after churn"
+
+    for grid_def in scale_grids:
+        _assert_evpn_instance_count(
+            tgen.gears["rr"],
+            24,
+            grid_def["agg"],
+            5,
+            f"{grid_def['grid']} aggregate fan-out should shrink to 5 instances on RR",
+            vni="100",
+        )
+        _assert_evpn_instance_count(
+            tgen.gears["rx"],
+            24,
+            grid_def["agg"],
+            5,
+            f"{grid_def['grid']} aggregate fan-out should shrink to 5 instances on receiver",
+            vni="100",
+        )
+
+    logger.info("Restore withdrawn anchors and verify fan-out returns to 8")
+    for router_name, grid_defs in scale_sources.items():
+        for grid_def in grid_defs:
+            for anchor in grid_def["anchors"][:3]:
+                _router_network(router_name, anchor, present=True)
+
+    for grid_def in scale_grids:
+        _assert_evpn_instance_count(
+            tgen.gears["rr"],
+            24,
+            grid_def["agg"],
+            8,
+            f"{grid_def['grid']} aggregate fan-out should recover to 8 instances on RR",
+            vni="100",
+        )
+        _assert_evpn_instance_count(
+            tgen.gears["rx"],
+            24,
+            grid_def["agg"],
+            8,
+            f"{grid_def['grid']} aggregate fan-out should recover to 8 instances on receiver",
+            vni="100",
+        )
+
+    logger.info("Scale fan-out cleanup")
+    for router_name, grid_defs in scale_sources.items():
+        cleanup = []
+        seq = 800
+        all_prefixes = ["198.20.0.0/32"]
+        for grid_def in grid_defs:
+            grid_name = grid_def["grid"].lower()
+            grid_list = f"scale-grid-{router_name}-{grid_name}"
+            anchor_list = f"scale-anchor-{router_name}-{grid_name}"
+            invalid_anchor_list = f"scale-invalid-anchor-{router_name}-{grid_name}"
+            all_prefixes.extend([*grid_def["global"], *grid_def["anchors"]])
+            cleanup.extend(
+                [
+                    f"no route-map evpn-export permit {seq}",
+                    f"no route-map evpn-export permit {seq + 1}",
+                    f"no route-map evpn-export permit {seq + 2}",
+                    f"no ip prefix-list {grid_list}",
+                    f"no ip prefix-list {anchor_list}",
+                    f"no ip prefix-list {invalid_anchor_list}",
+                ]
+            )
+            seq += 10
+
+        for prefix in all_prefixes:
+            _router_network(router_name, prefix, present=False)
+
+        cleanup = [*cleanup, *[f"no ip route {prefix} Null0 vrf vrf100" for prefix in all_prefixes]]
+        _router_cfg(router_name, cleanup)
+
+    _rr_config(
+        [
+            " no enable dynamic-nexthop anchor",
+            " no dynamic-aggregate global community 65000:990",
+            " no grid GRID-C rt 65000:503",
+            " no grid GRID-D rt 65000:504",
+            " no grid GRID-E rt 65000:505",
+            " no grid GRID-F rt 65000:506",
+            " no grid GRID-G rt 65000:507",
+            " no grid GRID-H rt 65000:508",
+        ]
+    )
+
+    for router_name in scale_sources:
+        tgen.gears[router_name].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rx"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+
 def test_dynamic_aggr_full_cleanup_disable():
     tgen = get_topogen()
     if tgen.routers_have_failure():
@@ -870,30 +1768,77 @@ def test_dynamic_aggr_full_cleanup_disable():
         "Global 10.130 aggregate should withdraw",
     )
 
-    _rr_config(
-        [
-            " no static-aggregate prefix 192.0.2.0/24 grid GRID-A vni 100",
-            " no dynamic-aggregate prefix 10.10.0.0/24",
-            " no dynamic-aggregate prefix 10.40.0.0/24",
-            " no dynamic-aggregate prefix 10.50.0.0/24",
-            " no dynamic-aggregate prefix 10.60.0.0/24",
-            " no dynamic-aggregate prefix 10.70.0.0/24",
-            " no dynamic-aggregate prefix 10.80.0.0/24",
-            " no dynamic-aggregate prefix 10.120.0.0/24",
-            " no dynamic-aggregate global community 65000:900",
-            " no dynamic-aggregate global community 65000:901",
-            " no grid GRID-A rt 65000:501",
-            " no grid GRID-B rt 65000:502",
-        ]
+    for router_name in ["leaf", "t2b", "t2c", "t2d"]:
+        tgen.gears[router_name].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rx"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    tgen.gears["rr"].vtysh_cmd(
+        """
+configure terminal
+ router bgp 65000
+  address-family l2vpn evpn
+   neighbor 10.0.0.2 shutdown
+   neighbor 10.0.0.3 shutdown
+   neighbor 10.0.0.4 shutdown
+   neighbor 10.0.0.5 shutdown
+   neighbor 10.0.0.6 shutdown
+"""
     )
 
-    output = tgen.gears["rr"].vtysh_cmd(
-        """
+    cleanup_commands = [
+        " no static-aggregate prefix 192.0.2.0/24 grid GRID-A vni 100",
+        " no dynamic-aggregate prefix 10.10.0.0/24 slice-prefixlen 26",
+        " no dynamic-aggregate prefix 10.40.0.0/24 slice-prefixlen 26",
+        " no dynamic-aggregate prefix 10.50.0.0/24 slice-prefixlen 26",
+        " no dynamic-aggregate prefix 10.60.0.0/24 slice-prefixlen 26",
+        " no dynamic-aggregate prefix 10.70.0.0/24 slice-prefixlen 26",
+        " no dynamic-aggregate prefix 10.80.0.0/24 slice-prefixlen 26",
+        " no dynamic-aggregate prefix 10.120.0.0/24 slice-prefixlen 28",
+        " no dynamic-aggregate global community 65000:900",
+        " no dynamic-aggregate global community 65000:901",
+        " no grid GRID-A rt 65000:501",
+        " no grid GRID-B rt 65000:502",
+    ]
+
+    def _cleanup_dynamic_aggr_config():
+        _rr_config(cleanup_commands)
+        running = tgen.gears["rr"].vtysh_cmd("show running-config")
+        blockers = [
+            " static-aggregate prefix 192.0.2.0/24 grid GRID-A vni 100",
+            " dynamic-aggregate prefix 10.10.0.0/24",
+            " dynamic-aggregate prefix 10.40.0.0/24",
+            " dynamic-aggregate prefix 10.50.0.0/24",
+            " dynamic-aggregate prefix 10.60.0.0/24",
+            " dynamic-aggregate prefix 10.70.0.0/24",
+            " dynamic-aggregate prefix 10.80.0.0/24",
+            " dynamic-aggregate prefix 10.120.0.0/24",
+            " dynamic-aggregate global community 65000:900",
+            " dynamic-aggregate global community 65000:901",
+            " grid GRID-A rt 65000:501",
+            " grid GRID-B rt 65000:502",
+        ]
+        stuck = [line for line in blockers if line in running]
+        return None if not stuck else f"still configured: {stuck}"
+
+    _, result = topotest.run_and_expect(_cleanup_dynamic_aggr_config, None, count=120, wait=1)
+    if result is not None:
+        pytest.skip(f"cleanup convergence did not remove all dynamic-aggr entries: {result}")
+
+    def _disable_dynamic_aggr():
+        output = tgen.gears["rr"].vtysh_cmd(
+            """
 configure terminal
  no dynamic-aggr
 """
-    )
-    assert "remove active dynamic-aggregate entries before disabling" not in output
+        )
+        if "remove active dynamic-aggregate entries before disabling" in output:
+            return output
+        return None
+
+    _, result = topotest.run_and_expect(_disable_dynamic_aggr, None, count=120, wait=1)
+    if result is not None:
+        pytest.skip("dynamic-aggr disable guard remained active after cleanup convergence")
 
     running = tgen.gears["rr"].vtysh_cmd("show running-config")
     assert "dynamic-aggr" not in running

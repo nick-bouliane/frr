@@ -62,6 +62,7 @@
 #include "table.h"   /* route_table operations */
 #include "vty.h"     /* vty_out, struct vty (show command) */
 #include "mpls.h"    /* vni2label, label2vni, vni_t */
+#include "jhash.h"   /* jhash_3words */
 
 #include "bgpd/bgpd.h"	    /* struct bgp, bgp_get_evpn, peer_self, linklist.h */
 #include "bgpd/bgp_table.h" /* bgp_dest_get_prefix, bgp_node_get */
@@ -162,6 +163,7 @@ struct global_dynaggr_bucket {
 /* Dynamic Nexthop: one T2 identity entry */
 struct dynaggr_nexthop_entry {
 	char peer_host[INET6_ADDRSTRLEN + 1]; /* peer IP string (unique key) */
+	struct prefix anchor_pfx;              /* anchor route prefix identity */
 	struct in_addr vtep_ip;               /* EVPN next-hop = VTEP */
 	struct ethaddr rmac;                  /* Router MAC from extended community */
 	vni_t vni;
@@ -216,6 +218,10 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 			     vni_t vni);
 static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, struct grid *grid,
 			     vni_t vni);
+static struct dynaggr_nexthop_grid *dynaggr_nexthop_lookup_grid(struct grid *grid);
+static void dynaggr_fanout_reconcile_for_entry(struct grid *grid,
+					 const struct dynaggr_nexthop_entry *entry,
+					 bool is_announce);
 
 static struct cmd_node dynaggr_node = {
 	.name = "dynamic-aggr",
@@ -1039,14 +1045,47 @@ static struct prefix *compute_contiguous_aggregates(const struct bgp_path_info *
  * =================================================================== */
 
 /*
- * Originate an EVPN Type-5 aggregate route for a grid and VNI.
+ * Derive whether fan-out origination mode is active.
+ *
+ * In phase 1 this follows dynamic nexthop learning enablement.
  */
-static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, struct grid *grid,
-			     vni_t vni)
+static bool dynaggr_fanout_mode_enabled(void)
+{
+	return dynaggr_nexthop_anchor_set;
+}
+
+/*
+ * Build a deterministic fan-out RD from (site-id, grid, vtep, vni).
+ */
+static void dynaggr_form_fanout_rd(struct prefix_rd *prd, const struct grid *grid,
+				   const struct dynaggr_nexthop_entry *entry)
+{
+	uint32_t vtep = ntohl(entry->vtep_ip.s_addr);
+	uint32_t anchor = ntohl(entry->anchor_pfx.u.prefix4.s_addr);
+	uint32_t local_id;
+	char rd_str[64];
+
+	local_id = jhash_3words(vtep, (uint32_t)entry->vni,
+			       ((uint32_t)grid->community_val << 8) | entry->anchor_pfx.prefixlen,
+			       (uint32_t)dynaggr_cfg.site_id ^ anchor);
+	if (local_id == 0)
+		local_id = 1;
+
+	snprintf(rd_str, sizeof(rd_str), "%u:%u", dynaggr_cfg.site_id, local_id);
+	if (!str2prefix_rd(rd_str, prd))
+		memset(prd, 0, sizeof(*prd));
+}
+
+/*
+ * Originate one EVPN Type-5 aggregate instance with explicit route material.
+ */
+static void inject_aggregate_instance(const struct prefix *aggr_pfx, struct grid *grid,
+				      struct prefix_rd *prd, vni_t vni,
+				      const struct in_addr *nexthop,
+				      const struct ethaddr *rmac)
 {
 	struct bgp *bgp_evpn;
 	struct prefix_evpn evp;
-	struct prefix_rd prd;
 	struct attr attr;
 	struct attr *attr_new;
 	struct bgp_dest *dest;
@@ -1070,11 +1109,10 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 	}
 
 	build_type5_prefix_from_ip_prefix(&evp, aggr_pfx);
-	form_auto_rd(bgp_evpn->router_id, grid->rd_id, &prd);
 
 	/* Check if already installed */
 	dest = bgp_evpn_global_node_lookup(bgp_evpn->rib[AFI_L2VPN][SAFI_EVPN], SAFI_EVPN, &evp,
-					   &prd, NULL);
+					   prd, NULL);
 	if (dest) {
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
 			if (!CHECK_FLAG(pi->flags, BGP_PATH_REMOVED) &&
@@ -1090,15 +1128,21 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 	memset(&attr, 0, sizeof(attr));
 	bgp_attr_default_set(&attr, bgp_evpn, BGP_ORIGIN_IGP);
 
-	/* Next-hop = 0.0.0.0 — intentionally broken, route-map overrides */
-	memset(&attr.nexthop, 0, sizeof(attr.nexthop));
-	memset(&attr.mp_nexthop_global_in, 0, sizeof(attr.mp_nexthop_global_in));
+	if (nexthop) {
+		attr.nexthop = *nexthop;
+		attr.mp_nexthop_global_in = *nexthop;
+	} else {
+		/* Legacy behavior: route-map is expected to set final material. */
+		memset(&attr.nexthop, 0, sizeof(attr.nexthop));
+		memset(&attr.mp_nexthop_global_in, 0, sizeof(attr.mp_nexthop_global_in));
+	}
 	attr.mp_nexthop_len = BGP_ATTR_NHLEN_IPV4;
 	SET_FLAG(attr.flag, ATTR_FLAG_BIT(BGP_ATTR_NEXT_HOP));
 
 	/* Stamp grid community */
 	{
 		char comm_str[32];
+
 		snprintf(comm_str, sizeof(comm_str), "%u:%u", dynaggr_cfg.community_asn,
 			 grid->community_val);
 		comm = community_str2com(comm_str);
@@ -1116,15 +1160,19 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 	bgp_attr_set_ecommunity(&attr, ecom);
 	attr.encap_tunneltype = BGP_ENCAP_TYPE_VXLAN;
 
+	if (rmac)
+		bgp_add_routermac_ecom(&attr, (struct ethaddr *)rmac);
+
 	/* Stamp RT = site_id:VNI on originated aggregates. */
 	{
 		char rt_str[32];
+
 		snprintf(rt_str, sizeof(rt_str), "%u:%u", dynaggr_cfg.site_id, (uint32_t)vni);
 		rt_ecom = ecommunity_str2com(rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
 		if (rt_ecom) {
 			bgp_attr_set_ecommunity(&attr,
 						ecommunity_merge(bgp_attr_get_ecommunity(&attr),
-								 rt_ecom));
+							 rt_ecom));
 			ecommunity_free(&rt_ecom);
 		}
 	}
@@ -1135,7 +1183,7 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 
 	/* Get route node in global EVPN table */
 	dest = bgp_evpn_global_node_get(bgp_evpn->rib[AFI_L2VPN][SAFI_EVPN], AFI_L2VPN, SAFI_EVPN,
-					&evp, &prd, NULL);
+					&evp, prd, NULL);
 	assert(dest);
 
 	/* Create path_info */
@@ -1154,20 +1202,19 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 	bgp_process(bgp_evpn, dest, pi, AFI_L2VPN, SAFI_EVPN);
 	bgp_dest_unlock_node(dest);
 
-	zlog_info("DYNAGGR: originated %pFX grid=%s vni=%u community=%u:%u rt=%u:%u", aggr_pfx,
-		  grid->name, vni, dynaggr_cfg.community_asn, grid->community_val,
+	zlog_info("DYNAGGR: originated %pFX grid=%s vni=%u community=%u:%u rt=%u:%u",
+		  aggr_pfx, grid->name, vni, dynaggr_cfg.community_asn, grid->community_val,
 		  dynaggr_cfg.site_id, (uint32_t)vni);
 }
 
 /*
- * Withdraw an EVPN Type-5 aggregate route for a grid and VNI.
+ * Withdraw one EVPN Type-5 aggregate instance with explicit route material.
  */
-static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, struct grid *grid,
-			     vni_t vni)
+static void remove_aggregate_instance(const struct prefix *aggr_pfx, struct grid *grid,
+				      struct prefix_rd *prd, vni_t vni)
 {
 	struct bgp *bgp_evpn;
 	struct prefix_evpn evp;
-	struct prefix_rd prd;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 
@@ -1176,10 +1223,9 @@ static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 		return;
 
 	build_type5_prefix_from_ip_prefix(&evp, aggr_pfx);
-	form_auto_rd(bgp_evpn->router_id, grid->rd_id, &prd);
 
 	dest = bgp_evpn_global_node_lookup(bgp_evpn->rib[AFI_L2VPN][SAFI_EVPN], SAFI_EVPN, &evp,
-					   &prd, NULL);
+					   prd, NULL);
 	if (!dest)
 		return;
 
@@ -1198,6 +1244,162 @@ static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 	bgp_dest_unlock_node(dest);
 
 	zlog_info("DYNAGGR: withdrew %pFX grid=%s vni=%u", aggr_pfx, grid->name, vni);
+}
+
+static void dynaggr_fanout_apply_global_aggregates(struct global_dynaggr_tnode *n, uint32_t addr,
+						    uint8_t depth,
+						    struct grid *grid,
+						    struct prefix_rd *prd,
+						    const struct dynaggr_nexthop_entry *entry,
+						    bool is_announce)
+{
+	if (!n)
+		return;
+
+	if (n->is_aggregate) {
+		struct prefix aggr_pfx = make_prefix_hbo(addr, depth);
+
+		if (is_announce)
+			inject_aggregate_instance(&aggr_pfx, grid, prd, entry->vni, &entry->vtep_ip,
+						  &entry->rmac);
+		else
+			remove_aggregate_instance(&aggr_pfx, grid, prd, entry->vni);
+	}
+
+	dynaggr_fanout_apply_global_aggregates(n->child[0], addr, depth + 1, grid, prd, entry,
+					      is_announce);
+	dynaggr_fanout_apply_global_aggregates(
+		n->child[1], addr | (depth < 32 ? (1u << (31 - depth)) : 0), depth + 1, grid, prd,
+		entry, is_announce);
+}
+
+/*
+ * Reconcile one discovered nexthop tuple against all current desired aggregates.
+ */
+static void dynaggr_fanout_reconcile_for_entry(struct grid *grid,
+					 const struct dynaggr_nexthop_entry *entry,
+					 bool is_announce)
+{
+	uint32_t i;
+	struct prefix_rd prd;
+	struct scoped_dynaggr_bucket *b;
+	struct global_dynaggr_bucket *gb;
+
+	if (!dynaggr_fanout_mode_enabled() || !grid || !entry)
+		return;
+
+	dynaggr_form_fanout_rd(&prd, grid, entry);
+
+	for (i = 0; i < num_static_aggregates; i++) {
+		if (static_aggregates[i].grid != grid)
+			continue;
+		if (static_aggregates[i].vni != entry->vni)
+			continue;
+		if (is_announce)
+			inject_aggregate_instance(&static_aggregates[i].prefix, grid, &prd, entry->vni,
+						  &entry->vtep_ip, &entry->rmac);
+		else
+			remove_aggregate_instance(&static_aggregates[i].prefix, grid, &prd,
+						entry->vni);
+	}
+
+	for (i = 0; i < num_scoped_dynaggr_supernets; i++) {
+		for (b = scoped_dynaggr_supernets[i].grid_buckets; b; b = b->next) {
+			uint32_t j;
+
+			if (b->grid != grid)
+				continue;
+			if (b->vni != entry->vni)
+				continue;
+			for (j = 0; j < b->num_active_aggregates; j++) {
+				if (is_announce)
+					inject_aggregate_instance(&b->active_aggregates[j], grid, &prd,
+							  entry->vni, &entry->vtep_ip,
+							  &entry->rmac);
+				else
+					remove_aggregate_instance(&b->active_aggregates[j], grid, &prd,
+							entry->vni);
+			}
+		}
+	}
+
+	for (gb = global_dynaggr_buckets; gb; gb = gb->next) {
+		struct global_dynaggr_slice_bucket *sb;
+
+		if (gb->grid != grid)
+			continue;
+		if (gb->vni != entry->vni)
+			continue;
+
+		for (sb = gb->tree_slices; sb; sb = sb->next)
+			dynaggr_fanout_apply_global_aggregates(sb->tree_root, 0, 0, grid, &prd, entry,
+						      is_announce);
+	}
+}
+
+/*
+ * Originate an EVPN Type-5 aggregate route for a grid and VNI.
+ */
+static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, struct grid *grid,
+			     vni_t vni)
+{
+	struct prefix_rd prd;
+	struct bgp *bgp_evpn;
+
+	(void)bgp;
+	bgp_evpn = bgp_get_evpn();
+	if (!bgp_evpn)
+		return;
+
+	if (dynaggr_fanout_mode_enabled()) {
+		struct dynaggr_nexthop_grid *ng = dynaggr_nexthop_lookup_grid(grid);
+		struct dynaggr_nexthop_entry *e;
+
+		if (!ng)
+			return;
+
+		for (e = ng->entries; e; e = e->next) {
+			dynaggr_form_fanout_rd(&prd, grid, e);
+			inject_aggregate_instance(aggr_pfx, grid, &prd, e->vni, &e->vtep_ip,
+						  &e->rmac);
+		}
+		return;
+	}
+
+	form_auto_rd(bgp_evpn->router_id, grid->rd_id, &prd);
+	inject_aggregate_instance(aggr_pfx, grid, &prd, vni, NULL, NULL);
+}
+
+/*
+ * Withdraw an EVPN Type-5 aggregate route for a grid and VNI.
+ */
+static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, struct grid *grid,
+			     vni_t vni)
+{
+	struct prefix_rd prd;
+	struct bgp *bgp_evpn;
+
+	(void)bgp;
+	bgp_evpn = bgp_get_evpn();
+	if (!bgp_evpn)
+		return;
+
+	if (dynaggr_fanout_mode_enabled()) {
+		struct dynaggr_nexthop_grid *ng = dynaggr_nexthop_lookup_grid(grid);
+		struct dynaggr_nexthop_entry *e;
+
+		if (!ng)
+			return;
+
+		for (e = ng->entries; e; e = e->next) {
+			dynaggr_form_fanout_rd(&prd, grid, e);
+			remove_aggregate_instance(aggr_pfx, grid, &prd, e->vni);
+		}
+		return;
+	}
+
+	form_auto_rd(bgp_evpn->router_id, grid->rd_id, &prd);
+	remove_aggregate_instance(aggr_pfx, grid, &prd, vni);
 }
 
 /*
@@ -1426,16 +1628,32 @@ static struct dynaggr_nexthop_grid *dynaggr_nexthop_get_grid(struct grid *grid)
 }
 
 /*
+ * Find (without creating) the per-grid nexthop list.
+ */
+static struct dynaggr_nexthop_grid *dynaggr_nexthop_lookup_grid(struct grid *grid)
+{
+	struct dynaggr_nexthop_grid *g;
+
+	for (g = dynaggr_nexthop_grids; g; g = g->next) {
+		if (g->grid == grid)
+			return g;
+	}
+
+	return NULL;
+}
+
+/*
  * Register or update a T2 entry when an anchor route is announced.
  */
-static void dynaggr_nexthop_announce(struct bgp_path_info *route, struct grid *grid, vni_t vni)
+static void dynaggr_nexthop_announce(struct bgp_path_info *route, const struct prefix *anchor_pfx,
+				     struct grid *grid, vni_t vni)
 {
 	struct dynaggr_nexthop_grid *ng;
 	struct dynaggr_nexthop_entry *e;
 	struct ethaddr rmac;
 	bool has_rmac;
 
-	if (!route || !route->attr || !route->peer || !route->peer->host || !grid)
+	if (!route || !route->attr || !route->peer || !route->peer->host || !grid || !anchor_pfx)
 		return;
 
 	ng = dynaggr_nexthop_get_grid(grid);
@@ -1443,12 +1661,29 @@ static void dynaggr_nexthop_announce(struct bgp_path_info *route, struct grid *g
 
 	/* Update existing entry from same peer if present */
 	for (e = ng->entries; e; e = e->next) {
-		if (strcmp(e->peer_host, route->peer->host) != 0)
+		if (!prefix_same(&e->anchor_pfx, anchor_pfx))
 			continue;
-		e->vtep_ip = route->attr->mp_nexthop_global_in;
-		e->vni = vni;
-		if (has_rmac)
-			e->rmac = rmac;
+		{
+			struct dynaggr_nexthop_entry old = *e;
+			bool changed = false;
+
+			if (old.vtep_ip.s_addr != route->attr->mp_nexthop_global_in.s_addr)
+				changed = true;
+			if (old.vni != vni)
+				changed = true;
+			if (has_rmac && memcmp(&old.rmac, &rmac, sizeof(rmac)) != 0)
+				changed = true;
+
+			e->vtep_ip = route->attr->mp_nexthop_global_in;
+			e->vni = vni;
+			if (has_rmac)
+				e->rmac = rmac;
+
+			if (changed) {
+				dynaggr_fanout_reconcile_for_entry(grid, &old, false);
+				dynaggr_fanout_reconcile_for_entry(grid, e, true);
+			}
+		}
 		zlog_info("DYNAGGR: nexthop-anchor: updated T2 peer=%s vtep=%pI4 vni=%u grid=%s",
 			  e->peer_host, &e->vtep_ip, vni, grid->name);
 		return;
@@ -1456,6 +1691,7 @@ static void dynaggr_nexthop_announce(struct bgp_path_info *route, struct grid *g
 
 	e = XCALLOC(MTYPE_DYNAGGR, sizeof(*e));
 	strlcpy(e->peer_host, route->peer->host, sizeof(e->peer_host));
+	e->anchor_pfx = *anchor_pfx;
 	e->vtep_ip = route->attr->mp_nexthop_global_in;
 	e->vni = vni;
 	if (has_rmac)
@@ -1463,6 +1699,7 @@ static void dynaggr_nexthop_announce(struct bgp_path_info *route, struct grid *g
 	e->next = ng->entries;
 	ng->entries = e;
 	ng->count++;
+	dynaggr_fanout_reconcile_for_entry(grid, e, true);
 	zlog_info("DYNAGGR: nexthop-anchor: registered T2 peer=%s vtep=%pI4 vni=%u grid=%s",
 		  e->peer_host, &e->vtep_ip, vni, grid->name);
 }
@@ -1470,23 +1707,25 @@ static void dynaggr_nexthop_announce(struct bgp_path_info *route, struct grid *g
 /*
  * Remove a T2 entry when its anchor route is withdrawn.
  */
-static void dynaggr_nexthop_withdraw(struct bgp_path_info *route, struct grid *grid)
+static void dynaggr_nexthop_withdraw(struct bgp_path_info *route, const struct prefix *anchor_pfx,
+				     struct grid *grid)
 {
 	struct dynaggr_nexthop_grid *ng;
 	struct dynaggr_nexthop_entry **epp;
 
-	if (!route || !route->peer || !route->peer->host || !grid)
+	if (!route || !route->peer || !route->peer->host || !grid || !anchor_pfx)
 		return;
 
 	for (ng = dynaggr_nexthop_grids; ng; ng = ng->next) {
 		if (ng->grid != grid)
 			continue;
 		for (epp = &ng->entries; *epp; epp = &(*epp)->next) {
-			if (strcmp((*epp)->peer_host, route->peer->host) != 0)
+			if (!prefix_same(&(*epp)->anchor_pfx, anchor_pfx))
 				continue;
 			{
 				struct dynaggr_nexthop_entry *old = *epp;
 
+				dynaggr_fanout_reconcile_for_entry(grid, old, false);
 				zlog_info("DYNAGGR: nexthop-anchor: removed T2 peer=%s grid=%s",
 					  old->peer_host, grid->name);
 				*epp = old->next;
@@ -1576,20 +1815,44 @@ static int dynaggr_route_update(struct bgp *bgp, afi_t afi, safi_t safi, struct 
 	if (ip_pfx.family != AF_INET)
 		return 0;
 
+	{
+		const char *peer_host =
+			(route && route->peer && route->peer->host) ? route->peer->host : "-";
+		const struct community *comm =
+			(route && route->attr) ? bgp_attr_get_community(route->attr) : NULL;
+		const char *comm_text = comm ? community_str((struct community *)comm, false, false)
+						 : "-";
+		bool anchor_candidate =
+			dynaggr_nexthop_anchor_set && prefix_match(&dynaggr_nexthop_anchor, &ip_pfx) &&
+			ip_pfx.prefixlen >= dynaggr_nexthop_anchor.prefixlen;
+
+		zlog_info("DYNAGGR: route-update: %s %pFX peer=%s communities=%s anchor-candidate=%s",
+			  is_announce ? "announce" : "withdraw", &ip_pfx, peer_host, comm_text,
+			  anchor_candidate ? "yes" : "no");
+	}
+
 	grid = get_grid_from_route(route);
-	if (!grid)
+	if (!grid) {
+		zlog_info("DYNAGGR: route-update: drop %pFX reason=no-grid", &ip_pfx);
 		return 0;
+	}
 
 	vni = get_vni_from_route(route);
-	if (!vni)
+	if (!vni) {
+		zlog_info("DYNAGGR: route-update: drop %pFX reason=no-vni grid=%s", &ip_pfx,
+			  grid->name);
 		return 0;
+	}
 
 	/* Dynamic nexthop anchor: treat matching route as T2 identity signal */
-	if (dynaggr_nexthop_anchor_set && prefix_same(&ip_pfx, &dynaggr_nexthop_anchor)) {
+	if (dynaggr_nexthop_anchor_set && prefix_match(&dynaggr_nexthop_anchor, &ip_pfx) &&
+	    ip_pfx.prefixlen >= dynaggr_nexthop_anchor.prefixlen) {
+		zlog_info("DYNAGGR: route-update: anchor-match %s %pFX grid=%s vni=%u",
+			  is_announce ? "announce" : "withdraw", &ip_pfx, grid->name, vni);
 		if (is_announce)
-			dynaggr_nexthop_announce(route, grid, vni);
+			dynaggr_nexthop_announce(route, &ip_pfx, grid, vni);
 		else
-			dynaggr_nexthop_withdraw(route, grid);
+			dynaggr_nexthop_withdraw(route, &ip_pfx, grid);
 		return 0;
 	}
 
@@ -2926,8 +3189,8 @@ DEFUN(show_dynamic_nexthop, show_dynamic_nexthop_cmd,
 				 e->rmac.octet[0], e->rmac.octet[1],
 				 e->rmac.octet[2], e->rmac.octet[3],
 				 e->rmac.octet[4], e->rmac.octet[5]);
-			vty_out(vty, "    peer=%-20s vtep=%-15pI4 rmac=%s vni=%u\n",
-				e->peer_host, &e->vtep_ip, rmac_str, e->vni);
+			vty_out(vty, "    anchor=%-18pFX peer=%-20s vtep=%-15pI4 rmac=%s vni=%u\n",
+				&e->anchor_pfx, e->peer_host, &e->vtep_ip, rmac_str, e->vni);
 		}
 	}
 
