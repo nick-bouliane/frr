@@ -1058,14 +1058,15 @@ static bool dynaggr_fanout_mode_enabled(void)
  * Build a deterministic fan-out RD from (site-id, grid, vtep, vni).
  */
 static void dynaggr_form_fanout_rd(struct prefix_rd *prd, const struct grid *grid,
-				   const struct dynaggr_nexthop_entry *entry)
+				   const struct dynaggr_nexthop_entry *entry,
+				   vni_t vni)
 {
 	uint32_t vtep = ntohl(entry->vtep_ip.s_addr);
 	uint32_t anchor = ntohl(entry->anchor_pfx.u.prefix4.s_addr);
 	uint32_t local_id;
 	char rd_str[64];
 
-	local_id = jhash_3words(vtep, (uint32_t)entry->vni,
+	local_id = jhash_3words(vtep, (uint32_t)vni,
 			       ((uint32_t)grid->community_val << 8) | entry->anchor_pfx.prefixlen,
 			       (uint32_t)dynaggr_cfg.site_id ^ anchor);
 	if (local_id == 0)
@@ -1288,20 +1289,22 @@ static void dynaggr_fanout_reconcile_for_entry(struct grid *grid,
 	if (!dynaggr_fanout_mode_enabled() || !grid || !entry)
 		return;
 
-	dynaggr_form_fanout_rd(&prd, grid, entry);
-
 	for (i = 0; i < num_static_aggregates; i++) {
 		if (static_aggregates[i].grid != grid)
 			continue;
-		if (static_aggregates[i].vni != entry->vni)
-			continue;
+
+		dynaggr_form_fanout_rd(&prd, grid, entry, static_aggregates[i].vni);
+
 		if (is_announce)
-			inject_aggregate_instance(&static_aggregates[i].prefix, grid, &prd, entry->vni,
+			inject_aggregate_instance(&static_aggregates[i].prefix, grid, &prd,
+						  static_aggregates[i].vni,
 						  &entry->vtep_ip, &entry->rmac);
 		else
 			remove_aggregate_instance(&static_aggregates[i].prefix, grid, &prd,
-						entry->vni);
+						static_aggregates[i].vni);
 	}
+
+	dynaggr_form_fanout_rd(&prd, grid, entry, entry->vni);
 
 	for (i = 0; i < num_scoped_dynaggr_supernets; i++) {
 		for (b = scoped_dynaggr_supernets[i].grid_buckets; b; b = b->next) {
@@ -1345,6 +1348,8 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 {
 	struct prefix_rd prd;
 	struct bgp *bgp_evpn;
+	bool is_static = false;
+	uint32_t i;
 
 	(void)bgp;
 	bgp_evpn = bgp_get_evpn();
@@ -1355,12 +1360,24 @@ static void inject_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 		struct dynaggr_nexthop_grid *ng = dynaggr_nexthop_lookup_grid(grid);
 		struct dynaggr_nexthop_entry *e;
 
+		for (i = 0; i < num_static_aggregates; i++) {
+			if (static_aggregates[i].grid == grid &&
+			    static_aggregates[i].vni == vni &&
+			    prefix_same(&static_aggregates[i].prefix, aggr_pfx)) {
+				is_static = true;
+				break;
+			}
+		}
+
 		if (!ng)
 			return;
 
 		for (e = ng->entries; e; e = e->next) {
-			dynaggr_form_fanout_rd(&prd, grid, e);
-			inject_aggregate_instance(aggr_pfx, grid, &prd, e->vni, &e->vtep_ip,
+			if (!is_static && e->vni != vni)
+				continue;
+
+			dynaggr_form_fanout_rd(&prd, grid, e, vni);
+			inject_aggregate_instance(aggr_pfx, grid, &prd, vni, &e->vtep_ip,
 						  &e->rmac);
 		}
 		return;
@@ -1378,6 +1395,8 @@ static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 {
 	struct prefix_rd prd;
 	struct bgp *bgp_evpn;
+	bool is_static = false;
+	uint32_t i;
 
 	(void)bgp;
 	bgp_evpn = bgp_get_evpn();
@@ -1388,12 +1407,24 @@ static void remove_aggregate(struct bgp *bgp, const struct prefix *aggr_pfx, str
 		struct dynaggr_nexthop_grid *ng = dynaggr_nexthop_lookup_grid(grid);
 		struct dynaggr_nexthop_entry *e;
 
+		for (i = 0; i < num_static_aggregates; i++) {
+			if (static_aggregates[i].grid == grid &&
+			    static_aggregates[i].vni == vni &&
+			    prefix_same(&static_aggregates[i].prefix, aggr_pfx)) {
+				is_static = true;
+				break;
+			}
+		}
+
 		if (!ng)
 			return;
 
 		for (e = ng->entries; e; e = e->next) {
-			dynaggr_form_fanout_rd(&prd, grid, e);
-			remove_aggregate_instance(aggr_pfx, grid, &prd, e->vni);
+			if (!is_static && e->vni != vni)
+				continue;
+
+			dynaggr_form_fanout_rd(&prd, grid, e, vni);
+			remove_aggregate_instance(aggr_pfx, grid, &prd, vni);
 		}
 		return;
 	}
@@ -1659,8 +1690,10 @@ static void dynaggr_nexthop_announce(struct bgp_path_info *route, const struct p
 	ng = dynaggr_nexthop_get_grid(grid);
 	has_rmac = bgp_attr_rmac(route->attr, &rmac);
 
-	/* Update existing entry from same peer if present */
+	/* Update existing entry from same (peer, anchor) if present */
 	for (e = ng->entries; e; e = e->next) {
+		if (strcmp(e->peer_host, route->peer->host) != 0)
+			continue;
 		if (!prefix_same(&e->anchor_pfx, anchor_pfx))
 			continue;
 		{
@@ -1720,6 +1753,8 @@ static void dynaggr_nexthop_withdraw(struct bgp_path_info *route, const struct p
 		if (ng->grid != grid)
 			continue;
 		for (epp = &ng->entries; *epp; epp = &(*epp)->next) {
+			if (strcmp((*epp)->peer_host, route->peer->host) != 0)
+				continue;
 			if (!prefix_same(&(*epp)->anchor_pfx, anchor_pfx))
 				continue;
 			{

@@ -945,6 +945,104 @@ def test_fanout_multi_grid_three_anchors_per_grid():
     _, result = topotest.run_and_expect(_fanout_registry_match, None, count=60, wait=1)
     assert result is None, "Expected 3 discovered anchors per grid"
 
+    logger.info("Verify same-anchor multi-peer tracking keeps separate GRID-B entries")
+    shared_anchor = fanout_sources["leaf"]["anchors"][0]
+    _router_cfg(
+        "t2b",
+        [
+            "ip prefix-list fanout-shared-anchor-t2b seq 5 permit 198.18.0.1/32",
+            "route-map evpn-export permit 905",
+            " match ip address prefix-list fanout-shared-anchor-t2b",
+            " set community 65000:501 additive",
+        ],
+    )
+    _router_network("t2b", shared_anchor, present=True)
+    _router_cfg("t2b", [f"ip route {shared_anchor} Null0 vrf vrf100"])
+    tgen.gears["t2b"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    def _fanout_registry_same_anchor_match():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        checks = [
+            r"Grid GRID-A \(4 entries\)",
+            r"anchor=198\.18\.0\.1/32\s+peer=10\.0\.0\.2",
+            r"anchor=198\.18\.0\.1/32\s+peer=10\.0\.0\.4",
+        ]
+        missing = [p for p in checks if not re.search(p, output)]
+        return None if not missing else f"missing {missing} in:\n{output}"
+
+    _, result = topotest.run_and_expect(_fanout_registry_same_anchor_match, None, count=60, wait=1)
+    assert result is None, "Same anchor announced by two peers should create two GRID-A nexthop entries"
+
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        4,
+        "GRID-A aggregate should fan out to 4 instances after shared-anchor multi-peer announce",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.210.0.0",
+        4,
+        "Receiver should learn 4 GRID-A fan-out instances after shared-anchor multi-peer announce",
+        vni="100",
+    )
+
+    logger.info("Withdraw one shared-anchor peer and verify remaining peer preserves GRID-B fan-out")
+    _router_network("leaf", shared_anchor, present=False)
+    tgen.gears["leaf"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
+    def _fanout_registry_same_anchor_one_peer_left():
+        output = tgen.gears["rr"].vtysh_cmd("show dynamic-nexthop", isjson=False)
+        checks = [
+            r"Grid GRID-A \(3 entries\)",
+            r"anchor=198\.18\.0\.1/32\s+peer=10\.0\.0\.4",
+        ]
+        missing = [p for p in checks if not re.search(p, output)]
+        if missing:
+            return f"missing {missing} in:\n{output}"
+        if re.search(r"anchor=198\.18\.0\.1/32\s+peer=10\.0\.0\.2", output):
+            return f"unexpected removed peer still present in:\n{output}"
+        return None
+
+    _, result = topotest.run_and_expect(_fanout_registry_same_anchor_one_peer_left, None, count=60, wait=1)
+    assert result is None, "Withdrawing one of shared-anchor peers should keep the other and preserve GRID-A fan-out"
+
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "10.210.0.0",
+        3,
+        "GRID-A aggregate should remain at 3 fan-out instances after one shared-anchor peer withdraw",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rx"],
+        24,
+        "10.210.0.0",
+        3,
+        "Receiver should keep GRID-A fan-out via remaining shared-anchor peer",
+        vni="100",
+    )
+
+    _router_network("leaf", shared_anchor, present=True)
+    _router_network("t2b", shared_anchor, present=False)
+    _router_cfg(
+        "t2b",
+        [
+            f"no ip route {shared_anchor} Null0 vrf vrf100",
+            "no route-map evpn-export permit 905",
+            "no ip prefix-list fanout-shared-anchor-t2b",
+        ],
+    )
+    tgen.gears["leaf"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["t2b"].vtysh_cmd("clear bgp l2vpn evpn *")
+    tgen.gears["rr"].vtysh_cmd("clear bgp l2vpn evpn *")
+
     logger.info("Validate per-grid global aggregates fan out into 3 instances each")
     _assert_evpn_instance_count(
         tgen.gears["rr"],
@@ -977,6 +1075,27 @@ def test_fanout_multi_grid_three_anchors_per_grid():
         3,
         "GRID-D global aggregate should fan out to 3 instances",
         vni="100",
+    )
+
+    logger.info(
+        "Verify static fan-out uses configured static VNI(s), not learned anchor VNI"
+    )
+    _rr_config([" static-aggregate prefix 192.0.2.0/24 grid GRID-A vni 200"])
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "192.0.2.0",
+        3,
+        "Static GRID-A /24 should fan out in configured VNI 100",
+        vni="100",
+    )
+    _assert_evpn_instance_count(
+        tgen.gears["rr"],
+        24,
+        "192.0.2.0",
+        3,
+        "Static GRID-A /24 should also fan out in configured VNI 200 despite anchors learned in VNI 100",
+        vni="200",
     )
 
     logger.info("Validate receiver sees 3-way fan-out aggregates and no contributor /25 routes")
@@ -1262,6 +1381,7 @@ def test_fanout_multi_grid_three_anchors_per_grid():
 
     _rr_config(
         [
+            " no static-aggregate prefix 192.0.2.0/24 grid GRID-A vni 200",
             " no enable dynamic-nexthop anchor",
             " no dynamic-aggregate global community 65000:990",
             " no grid GRID-C rt 65000:503",
