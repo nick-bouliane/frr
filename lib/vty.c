@@ -141,11 +141,12 @@ void vty_resume_response(struct vty *vty, int ret)
 	if (vty->type != VTY_FILE) {
 		header[3] = ret;
 		buffer_put(vty->obuf, header, 4);
-		if (!event_is_scheduled(vty->t_write) && (vtysh_flush(vty) < 0)) {
+		/* On write error vtysh_flush() sets VTY_CLOSE; keep going so
+		 * the session is torn down below instead of leaking with
+		 * read processing suspended.
+		 */
+		if (!event_is_scheduled(vty->t_write) && (vtysh_flush(vty) < 0))
 			zlog_err("failed to vtysh_flush");
-			/* Try to flush results; exit if a write error occurs */
-			return;
-		}
 	}
 
 	if (vty->status == VTY_CLOSE)
@@ -2352,6 +2353,19 @@ static void vtysh_read(struct event *event)
 					return;
 				}
 
+				/* The response is owned by an out-of-band
+				 * writer (e.g. a forked show worker with a
+				 * copy of this socket).  Same sequence point
+				 * as the pass_fd case above: no status
+				 * marker now and read processing stays
+				 * suspended; both happen when the daemon
+				 * calls vty_resume_response().
+				 */
+				if (vty->defer_response) {
+					vty->defer_response = false;
+					return;
+				}
+
 				/* warning: watchfrr hardcodes this result write
 				 */
 				header[3] = ret;
@@ -2441,6 +2455,16 @@ void vty_close(struct vty *vty)
 
 	if (vty_close_mgmt_cb)
 		vty_close_mgmt_cb(vty);
+
+	/* If an out-of-band writer still owes this session a deferred
+	 * response, tell its owner the vty is going away (see
+	 * defer_close_cb in vty.h).
+	 */
+	if (vty->defer_close_cb) {
+		vty->defer_close_cb(vty, vty->defer_close_arg);
+		vty->defer_close_cb = NULL;
+		vty->defer_close_arg = NULL;
+	}
 
 	/* Cancel threads.*/
 	event_cancel(&vty->t_read);

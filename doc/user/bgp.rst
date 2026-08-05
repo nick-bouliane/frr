@@ -4880,6 +4880,22 @@ The following command is available in ``config`` mode as well as in the
    Set the BGP Output Queue limit for all peers when messaging parsing. Increase
    this only if you have the memory to handle large queues of messages at once.
 
+.. clicmd:: bgp show-worker-limit (1-64)
+
+   Set the maximum number of forked show command workers running at the
+   same time. Default is 4.
+
+   Expensive show commands issued from ``vtysh`` are executed in a
+   short-lived forked child process so that *bgpd* keeps processing BGP
+   while the output is rendered. Each worker holds a copy-on-write
+   snapshot of the daemon's memory, so the worst-case memory overhead of
+   concurrent workers grows with table size and update churn. When the
+   limit is reached, additional show commands are refused with an error
+   (and the refusal is logged) rather than run inline, so that a burst of
+   expensive commands cannot stall the daemon. Increase this only if the
+   logs show the limit being hit in normal operation and the router has
+   memory headroom for additional concurrent snapshots.
+
 .. _bgp-displaying-bgp-information:
 
 Displaying BGP Information

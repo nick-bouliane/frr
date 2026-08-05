@@ -7,6 +7,8 @@
 
 #include <zebra.h>
 #include "command.h"
+#include "frrevent.h"
+#include "network.h"
 #include "prefix.h"
 #include "lib/json.h"
 #include "lib/printfrr.h"
@@ -1521,14 +1523,50 @@ static int bgp_show_ethernet_vpn(struct vty *vty, struct prefix_rd *prd,
 	return CMD_SUCCESS;
 }
 
+struct bgp_show_ethernet_vpn_args {
+	struct prefix_rd *prd;
+	enum bgp_show_type type;
+	void *output_arg;
+	int option;
+	bool use_json;
+};
+
+static int bgp_show_fork_run_ethernet_vpn(struct vty *vty, void *arg)
+{
+	struct bgp_show_ethernet_vpn_args *show = arg;
+
+	return bgp_show_ethernet_vpn(vty, show->prd, show->type,
+				     show->output_arg, show->option,
+				     show->use_json);
+}
+
+/* Run bgp_show_ethernet_vpn() in a forked show worker (see the "Forked
+ * show workers" comment in bgp_route.c); walking the full EVPN table can
+ * hold the event loop for a long time on a loaded route reflector.
+ */
+static int bgp_show_ethernet_vpn_forked(struct vty *vty, struct prefix_rd *prd,
+					enum bgp_show_type type, void *output_arg,
+					int option, bool use_json)
+{
+	struct bgp_show_ethernet_vpn_args args = {
+		.prd = prd,
+		.type = type,
+		.output_arg = output_arg,
+		.option = option,
+		.use_json = use_json,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_ethernet_vpn, &args);
+}
+
 DEFUN(show_ip_bgp_l2vpn_evpn,
       show_ip_bgp_l2vpn_evpn_cmd,
       "show [ip] bgp l2vpn evpn [json]",
       SHOW_STR IP_STR BGP_STR L2VPN_HELP_STR EVPN_HELP_STR JSON_STR)
 {
-	return bgp_show_ethernet_vpn(vty, NULL, bgp_show_type_normal, NULL,
-				     SHOW_DISPLAY_STANDARD,
-				     use_json(argc, argv));
+	return bgp_show_ethernet_vpn_forked(vty, NULL, bgp_show_type_normal,
+					    NULL, SHOW_DISPLAY_STANDARD,
+					    use_json(argc, argv));
 }
 
 DEFUN(show_ip_bgp_l2vpn_evpn_rd,
@@ -1550,9 +1588,10 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd,
 	int rd_all = 0;
 
 	if (argv_find(argv, argc, "all", &rd_all))
-		return bgp_show_ethernet_vpn(vty, NULL, bgp_show_type_normal,
-					     NULL, SHOW_DISPLAY_STANDARD,
-					     use_json(argc, argv));
+		return bgp_show_ethernet_vpn_forked(vty, NULL,
+						    bgp_show_type_normal, NULL,
+						    SHOW_DISPLAY_STANDARD,
+						    use_json(argc, argv));
 
 	argv_find(argv, argc, "ASN:NN_OR_IP-ADDRESS:NN", &idx_ext_community);
 	ret = str2prefix_rd(argv[idx_ext_community]->arg, &prd);
@@ -1560,9 +1599,9 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd,
 		vty_out(vty, "%% Malformed Route Distinguisher\n");
 		return CMD_WARNING;
 	}
-	return bgp_show_ethernet_vpn(vty, &prd, bgp_show_type_normal, NULL,
-				     SHOW_DISPLAY_STANDARD,
-				     use_json(argc, argv));
+	return bgp_show_ethernet_vpn_forked(vty, &prd, bgp_show_type_normal,
+					    NULL, SHOW_DISPLAY_STANDARD,
+					    use_json(argc, argv));
 }
 
 DEFUN(show_ip_bgp_l2vpn_evpn_all_tags,
@@ -1576,8 +1615,8 @@ DEFUN(show_ip_bgp_l2vpn_evpn_all_tags,
       "Display information about all EVPN NLRIs\n"
       "Display BGP tags for prefixes\n")
 {
-	return bgp_show_ethernet_vpn(vty, NULL, bgp_show_type_normal, NULL,
-				     SHOW_DISPLAY_TAGS, 0);
+	return bgp_show_ethernet_vpn_forked(vty, NULL, bgp_show_type_normal,
+					    NULL, SHOW_DISPLAY_TAGS, 0);
 }
 
 DEFUN(show_ip_bgp_l2vpn_evpn_rd_tags,
@@ -1599,8 +1638,9 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd_tags,
 	int rd_all = 0;
 
 	if (argv_find(argv, argc, "all", &rd_all))
-		return bgp_show_ethernet_vpn(vty, NULL, bgp_show_type_normal,
-					     NULL, SHOW_DISPLAY_TAGS, 0);
+		return bgp_show_ethernet_vpn_forked(vty, NULL,
+						    bgp_show_type_normal, NULL,
+						    SHOW_DISPLAY_TAGS, 0);
 
 	argv_find(argv, argc, "ASN:NN_OR_IP-ADDRESS:NN", &idx_ext_community);
 	ret = str2prefix_rd(argv[idx_ext_community]->arg, &prd);
@@ -1608,8 +1648,8 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd_tags,
 		vty_out(vty, "%% Malformed Route Distinguisher\n");
 		return CMD_WARNING;
 	}
-	return bgp_show_ethernet_vpn(vty, &prd, bgp_show_type_normal, NULL,
-				     SHOW_DISPLAY_TAGS, 0);
+	return bgp_show_ethernet_vpn_forked(vty, &prd, bgp_show_type_normal,
+					    NULL, SHOW_DISPLAY_TAGS, 0);
 }
 
 DEFUN(show_ip_bgp_l2vpn_evpn_neighbor_routes,
@@ -1963,9 +2003,9 @@ DEFUN(show_ip_bgp_l2vpn_evpn_all_overlay,
       "Display BGP Overlay Information for prefixes\n"
       JSON_STR)
 {
-	return bgp_show_ethernet_vpn(vty, NULL, bgp_show_type_normal, NULL,
-				     SHOW_DISPLAY_OVERLAY,
-				     use_json(argc, argv));
+	return bgp_show_ethernet_vpn_forked(vty, NULL, bgp_show_type_normal,
+					    NULL, SHOW_DISPLAY_OVERLAY,
+					    use_json(argc, argv));
 }
 
 DEFUN(show_ip_bgp_evpn_rd_overlay,
@@ -1987,9 +2027,10 @@ DEFUN(show_ip_bgp_evpn_rd_overlay,
 	int rd_all = 0;
 
 	if (argv_find(argv, argc, "all", &rd_all))
-		return bgp_show_ethernet_vpn(vty, NULL, bgp_show_type_normal,
-					     NULL, SHOW_DISPLAY_OVERLAY,
-					     use_json(argc, argv));
+		return bgp_show_ethernet_vpn_forked(vty, NULL,
+						    bgp_show_type_normal, NULL,
+						    SHOW_DISPLAY_OVERLAY,
+						    use_json(argc, argv));
 
 	argv_find(argv, argc, "ASN:NN_OR_IP-ADDRESS:NN", &idx_ext_community);
 	ret = str2prefix_rd(argv[idx_ext_community]->arg, &prd);
@@ -1997,9 +2038,9 @@ DEFUN(show_ip_bgp_evpn_rd_overlay,
 		vty_out(vty, "%% Malformed Route Distinguisher\n");
 		return CMD_WARNING;
 	}
-	return bgp_show_ethernet_vpn(vty, &prd, bgp_show_type_normal, NULL,
-				     SHOW_DISPLAY_OVERLAY,
-				     use_json(argc, argv));
+	return bgp_show_ethernet_vpn_forked(vty, &prd, bgp_show_type_normal,
+					    NULL, SHOW_DISPLAY_OVERLAY,
+					    use_json(argc, argv));
 }
 
 DEFUN(show_bgp_l2vpn_evpn_rt,
@@ -5089,7 +5130,6 @@ DEFUN(show_bgp_l2vpn_evpn_summary, show_bgp_l2vpn_evpn_summary_cmd,
 	if (argv_find(argv, argc, "established", &idx))
 		SET_FLAG(show_flags, BGP_SHOW_OPT_ESTABLISHED);
 
-
 	if (argv_find(argv, argc, "neighbor", &idx))
 		neighbor = argv[idx + 1]->arg;
 
@@ -5111,8 +5151,8 @@ DEFUN(show_bgp_l2vpn_evpn_summary, show_bgp_l2vpn_evpn_summary_cmd,
 	if (use_json(argc, argv))
 		SET_FLAG(show_flags, BGP_SHOW_OPT_JSON);
 
-	return bgp_show_summary_vty(vty, vrf, AFI_L2VPN, SAFI_EVPN, neighbor,
-				    as_type, as, show_flags);
+	return bgp_show_summary_vty_forked(vty, vrf, AFI_L2VPN, SAFI_EVPN,
+					   neighbor, as_type, as, show_flags);
 }
 
 static int bgp_evpn_cli_parse_type_cmp(int *type, const char *type_str)

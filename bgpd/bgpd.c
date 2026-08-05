@@ -9209,6 +9209,7 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	bm->master = master;
 	bm->start_time = monotime(NULL);
 	bm->rmap_update_timer = RMAP_DEFAULT_UPDATE_TIMER;
+	bm->show_worker_max = BGP_SHOW_WORKER_MAX_DEFAULT;
 	bm->v_update_delay = BGP_UPDATE_DELAY_DEFAULT;
 	bm->v_establish_wait = BGP_UPDATE_DELAY_DEFAULT;
 	bm->terminating = false;

@@ -77,6 +77,10 @@ def test_bgp_route_map_match_tag_untagged():
     _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
     assert result is None, "Tags for static routes are not as expected"
 
+    output = tgen.gears["r1"].vtysh_cmd("show bgp ipv4 unicast detail", isjson=False)
+    assert "10.10.10.10/32" in output
+    assert "10.10.10.20/32" in output
+
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]

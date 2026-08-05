@@ -8673,6 +8673,36 @@ DEFUN (no_bgp_set_route_map_delay_timer,
 	return CMD_SUCCESS;
 }
 
+/* Cap on concurrently forked show command workers (see "Forked show
+ * workers" in bgp_route.c).  Each worker holds a COW snapshot of bgpd's
+ * address space, so the memory cost of raising this grows with table
+ * size and churn; refusals are logged, so raise it based on evidence.
+ */
+DEFPY (bgp_show_worker_limit,
+       bgp_show_worker_limit_cmd,
+       "bgp show-worker-limit (1-64)$limit",
+       BGP_STR
+       "Limit concurrently forked show command workers\n"
+       "Maximum number of workers running at the same time\n")
+{
+	bm->show_worker_max = limit;
+
+	return CMD_SUCCESS;
+}
+
+DEFPY (no_bgp_show_worker_limit,
+       no_bgp_show_worker_limit_cmd,
+       "no bgp show-worker-limit [(1-64)]",
+       NO_STR
+       BGP_STR
+       "Reset the forked show command worker limit to default\n"
+       "Maximum number of workers running at the same time\n")
+{
+	bm->show_worker_max = BGP_SHOW_WORKER_MAX_DEFAULT;
+
+	return CMD_SUCCESS;
+}
+
 /* neighbor interface */
 static int peer_interface_vty(struct vty *vty, const char *ip_str,
 			      const char *str)
@@ -15007,6 +15037,42 @@ int bgp_show_summary_vty(struct vty *vty, const char *name, afi_t afi,
 	return CMD_SUCCESS;
 }
 
+struct bgp_show_summary_fork_args {
+	const char *vrf;
+	afi_t afi;
+	safi_t safi;
+	const char *neighbor;
+	enum peer_asn_type as_type;
+	as_t as;
+	uint16_t show_flags;
+};
+
+static int bgp_show_fork_run_summary(struct vty *vty, void *arg)
+{
+	struct bgp_show_summary_fork_args *s = arg;
+
+	return bgp_show_summary_vty(vty, s->vrf, s->afi, s->safi, s->neighbor,
+				    s->as_type, s->as, s->show_flags);
+}
+
+int bgp_show_summary_vty_forked(struct vty *vty, const char *name, afi_t afi,
+				safi_t safi, const char *neighbor,
+				enum peer_asn_type as_type, as_t as,
+				uint16_t show_flags)
+{
+	struct bgp_show_summary_fork_args args = {
+		.vrf = name,
+		.afi = afi,
+		.safi = safi,
+		.neighbor = neighbor,
+		.as_type = as_type,
+		.as = as,
+		.show_flags = show_flags,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_summary, &args);
+}
+
 /* `show [ip] bgp summary' commands. */
 DEFPY(show_ip_bgp_summary, show_ip_bgp_summary_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR
@@ -15083,8 +15149,8 @@ DEFPY(show_ip_bgp_summary, show_ip_bgp_summary_cmd,
 	if (argv_find(argv, argc, "json", &idx))
 		SET_FLAG(show_flags, BGP_SHOW_OPT_JSON);
 
-	return bgp_show_summary_vty(vty, vrf, afi, safi, neighbor, as_type, as,
-				    show_flags);
+	return bgp_show_summary_vty_forked(vty, vrf, afi, safi, neighbor,
+					   as_type, as, show_flags);
 }
 
 const char *get_afi_safi_str(afi_t afi, safi_t safi, bool for_json)
@@ -21937,6 +22003,9 @@ int bgp_config_write(struct vty *vty)
 		vty_out(vty, "bgp route-map delay-timer %u\n",
 			bm->rmap_update_timer);
 
+	if (bm->show_worker_max != BGP_SHOW_WORKER_MAX_DEFAULT)
+		vty_out(vty, "bgp show-worker-limit %u\n", bm->show_worker_max);
+
 	if (bm->v_update_delay != BGP_UPDATE_DELAY_DEFAULT) {
 		vty_out(vty, "bgp update-delay %d", bm->v_update_delay);
 		if (bm->v_update_delay != bm->v_establish_wait)
@@ -23011,6 +23080,8 @@ void bgp_vty_init(void)
 	/* bgp route-map delay-timer commands. */
 	install_element(CONFIG_NODE, &bgp_set_route_map_delay_timer_cmd);
 	install_element(CONFIG_NODE, &no_bgp_set_route_map_delay_timer_cmd);
+	install_element(CONFIG_NODE, &bgp_show_worker_limit_cmd);
+	install_element(CONFIG_NODE, &no_bgp_show_worker_limit_cmd);
 
 	install_element(BGP_NODE, &bgp_allow_martian_cmd);
 

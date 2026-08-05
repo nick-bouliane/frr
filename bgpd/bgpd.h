@@ -167,6 +167,13 @@ struct bgp_master {
 	uint32_t rmap_update_timer;   /* Route map update timer */
 #define RMAP_DEFAULT_UPDATE_TIMER 5 /* disabled by default */
 
+	/* Cap on concurrently forked show command workers; each worker
+	 * holds a COW snapshot of bgpd's address space (see the "Forked
+	 * show workers" comment in bgp_route.c).
+	 */
+	uint32_t show_worker_max;
+#define BGP_SHOW_WORKER_MAX_DEFAULT 4
+
 	/* Id space for automatic RD derivation for an EVI/VRF */
 	bitfield_t rd_idspace;
 

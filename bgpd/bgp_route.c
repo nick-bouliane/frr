@@ -6,6 +6,14 @@
 
 #include <zebra.h>
 #include <math.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <dirent.h>
+#include <poll.h>
+#ifdef GNU_LINUX
+#include <sys/prctl.h>
+#endif
 
 #include "bgpd/bgp_addpath_types.h"
 #include "printfrr.h"
@@ -22,6 +30,7 @@
 #include "sockunion.h"
 #include "plist.h"
 #include "frrevent.h"
+#include "network.h"
 #include "workqueue.h"
 #include "queue.h"
 #include "memory.h"
@@ -103,6 +112,7 @@ static bool bgp_attr_nexthop_same(const struct attr *attr1, const struct attr *a
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_EOIU_MARKER_INFO, "BGP EOIU Marker info");
 DEFINE_MTYPE_STATIC(BGPD, BGP_METAQ, "BGP MetaQ");
+DEFINE_MTYPE_STATIC(BGPD, BGP_SHOW_WORKER, "BGP forked show worker");
 /* Memory for batched clearing of peers from the RIB */
 DEFINE_MTYPE(BGPD, CLEARING_BATCH, "Clearing batch");
 
@@ -14449,6 +14459,689 @@ static int bgp_show(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 			      &json_header_depth, show_flags, rpki_target_state, brief);
 }
 
+/*
+ * Forked show workers
+ * -------------------
+ *
+ * Expensive show commands issued over vtysh are executed in a short-lived
+ * forked child (a "show worker") so that walking and rendering a large RIB
+ * does not monopolize the bgpd event loop.
+ *
+ * The worker writes the rendered output directly to the session socket it
+ * inherited across fork(), so the byte stream the client sees is
+ * indistinguishable from inline execution and no client-side changes are
+ * needed -- vtysh, monitoring exporters and anything else speaking the
+ * vtysh protocol keep working unmodified.  The exchange is split between
+ * worker and parent along the protocol's own seam:
+ *
+ *   - The WORKER writes only output bytes, never the trailing status
+ *     marker, and exits when the render is done.  Its exit code carries
+ *     the command status.
+ *   - The PARENT suppresses the immediate status marker for the command
+ *     (vty->defer_response; read processing stays suspended exactly as in
+ *     the lib's pass_fd sequence point) and returns to the event loop.
+ *     When the reaper collects the worker, it completes the exchange via
+ *     vty_resume_response().  The worker's last output write strictly
+ *     precedes its exit, and waitpid() strictly precedes the marker, so
+ *     the marker can never overtake output.
+ *
+ * If the session dies while a worker is in flight, vty_close() tells us
+ * through the vty's defer_close_cb and the reaper simply skips the
+ * finalization; the worker itself gets EPIPE on its next write and winds
+ * down on its own.
+ *
+ * fork() gives the worker a full copy of the daemon: its memory (which is
+ * exactly what makes reusing the renderers possible), but also its sockets,
+ * signal handlers and process name.  Everything except the memory snapshot
+ * and the session socket is a liability, because a worker can outlive its
+ * parent (bgpd crashes with a worker in flight) or outlive its usefulness
+ * (the client stops draining the socket).  bgp_show_worker_begin()
+ * therefore strips the child down to the bare renderer:
+ *
+ *  - Every inherited descriptor except the session socket is closed.  A
+ *    lingering worker must not hold the port-179 listener open (it would
+ *    fool TCP-probe health checks and prevent a restarted bgpd from
+ *    binding), and peer/zebra TCP sessions must be reset promptly if the
+ *    parent dies while a worker is still running.
+ *
+ *  - Signal dispositions and the signal mask are reset to defaults, with
+ *    one exception: SIGPIPE stays ignored.  If the client goes away,
+ *    writes must fail with EPIPE so stdio latches the stream error and the
+ *    render loop finishes on its own, instead of the worker being killed
+ *    mid-write.
+ *
+ *  - The process name (comm) is set to "bgpd-show" so pgrep/top-style
+ *    liveness checks do not mistake an orphaned worker for the daemon.
+ *
+ *  - A stall watchdog is armed.  A legitimate command has no useful upper
+ *    bound on total runtime (a full-table JSON dump on a large route
+ *    reflector takes minutes), so we bound *inactivity* instead: every
+ *    successful write re-arms alarm(BGP_SHOW_WORKER_STALL_SECS) and
+ *    SIGALRM is left at SIG_DFL.  A worker that makes no progress for
+ *    that long -- the client stopped draining the socket, or the walk
+ *    wedged on state that fork() copied mid-update -- is terminated by
+ *    the kernel with no cooperation needed from the wedged code itself.
+ *    The renewal needs a stdio write hook: fopencookie(3) on glibc/musl,
+ *    funopen(3) on the BSDs.  Platforms with neither get no watchdog at
+ *    all rather than a fixed cap that would kill legitimately slow
+ *    commands.
+ *
+ * The session socket is shared with the parent and is non-blocking (the
+ * O_NONBLOCK flag lives on the open file description, so the worker must
+ * not flip it); the worker's write hook waits for writability with poll()
+ * instead.  The parent will not write to the socket while the worker owns
+ * the reply, and a command whose previous output is still being flushed
+ * is run inline rather than forked, so worker and parent bytes can never
+ * interleave.
+ *
+ * The parent reaps workers asynchronously (bgp_show_fork_reap) and caps
+ * concurrency at bm->show_worker_max ("bgp show-worker-limit", default
+ * BGP_SHOW_WORKER_MAX_DEFAULT).  At the cap, new forkable commands are
+ * refused with an error: running them inline would block the event loop
+ * (the very thing this mechanism exists to avoid), and queueing would
+ * silently hang the caller, which waits synchronously.
+ *
+ * Rules for code running inside a worker: render to the vty and nothing
+ * else.  Do not log (zlog state was snapshotted mid-flight and its
+ * descriptors are closed), do not schedule events, do not touch sockets.
+ * The worker must never return into the daemon code path; it ends in
+ * _exit() so atexit()/cleanup handlers of the parent never run.
+ */
+
+/* Seconds a worker may go without writing a single byte into its output
+ * pipe before the stall watchdog (SIGALRM at SIG_DFL) terminates it.
+ * Generous on purpose: it only needs to catch workers that are stuck, not
+ * ones that are slow.
+ */
+#define BGP_SHOW_WORKER_STALL_SECS 300
+
+/* Number of workers currently forked and not yet reaped.  Incremented on
+ * fork in bgp_show_fork_run(), decremented in bgp_show_fork_reap() once
+ * waitpid() collects the child.
+ */
+static unsigned int bgp_show_workers_active;
+
+/* Parent-side record of one in-flight worker, owned by the reaper. */
+struct bgp_show_worker {
+	pid_t pid;
+
+	/* Session owed the deferred status marker; NULLed through
+	 * bgp_show_fork_vty_closed() if the session dies first.
+	 */
+	struct vty *vty;
+};
+
+/* vty defer_close_cb: the session closed while the worker was still
+ * running; drop the reference so the reaper does not resume into a freed
+ * vty.  The worker itself exits on its own once its writes hit EPIPE.
+ */
+static void bgp_show_fork_vty_closed(struct vty *vty, void *arg)
+{
+	struct bgp_show_worker *worker = arg;
+
+	worker->vty = NULL;
+}
+
+static void bgp_show_fork_reap(struct event *event)
+{
+	struct bgp_show_worker *worker = EVENT_ARG(event);
+	int status;
+	pid_t ret;
+
+	/* Reap only the show worker we created; do not disturb other children. */
+	do {
+		ret = waitpid(worker->pid, &status, WNOHANG);
+	} while (ret < 0 && errno == EINTR);
+
+	/* The show worker may still be writing. Poll without blocking bgpd. */
+	if (ret == 0) {
+		event_add_timer_msec(bm->master, bgp_show_fork_reap, worker,
+				     100, NULL);
+		return;
+	}
+
+	/* Collected (or already gone): release the concurrency slot.  An
+	 * underflow here would mean a worker was reaped twice or the
+	 * accounting was corrupted; clamp instead of wrapping the unsigned
+	 * counter, which would permanently jam the concurrency cap and
+	 * refuse every forkable command from then on.
+	 */
+	if (bgp_show_workers_active == 0)
+		zlog_err("%s: show worker accounting underflow reaping pid %d",
+			 __func__, (int)worker->pid);
+	else
+		bgp_show_workers_active--;
+
+	/* Complete the CLI exchange: the worker wrote only output bytes;
+	 * the status marker is sent here, strictly after the worker's last
+	 * write (which strictly precedes its exit).  The worker's exit code
+	 * carries the command status; a worker killed by a signal (e.g. its
+	 * stall watchdog) reports failure.
+	 */
+	if (worker->vty) {
+		int cmd_ret = CMD_WARNING;
+
+		if (ret > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+			cmd_ret = CMD_SUCCESS;
+
+		worker->vty->defer_close_cb = NULL;
+		worker->vty->defer_close_arg = NULL;
+		vty_resume_response(worker->vty, cmd_ret);
+	}
+
+	XFREE(MTYPE_BGP_SHOW_WORKER, worker);
+}
+
+/* Close every descriptor the worker inherited from bgpd except @keep_fd
+ * (the session socket the output is written to) and stdio.  This releases
+ * the child's duplicates of the listening, peer and zebra sockets (see
+ * the "Forked show workers" comment above).
+ */
+static void bgp_show_worker_close_fds(int keep_fd)
+{
+	struct rlimit nofile;
+	struct dirent *de;
+	rlim_t maxfd = 1024;
+	rlim_t fd;
+	DIR *dir;
+
+	dir = opendir("/proc/self/fd");
+	if (dir) {
+		int dir_fd = dirfd(dir);
+
+		while ((de = readdir(dir)) != NULL) {
+			char *end = NULL;
+			long n = strtol(de->d_name, &end, 10);
+
+			if (end == de->d_name || *end != '\0')
+				continue;
+			if (n <= STDERR_FILENO || n == keep_fd || n == dir_fd)
+				continue;
+			close((int)n);
+		}
+		closedir(dir);
+		return;
+	}
+
+	/* No /proc (or it failed to open): fall back to brute force up to
+	 * the descriptor limit.
+	 */
+	if (getrlimit(RLIMIT_NOFILE, &nofile) == 0 &&
+	    nofile.rlim_cur != RLIM_INFINITY)
+		maxfd = nofile.rlim_cur;
+
+	for (fd = STDERR_FILENO + 1; fd < maxfd; fd++)
+		if ((int)fd != keep_fd)
+			close((int)fd);
+}
+
+/* Return the worker to default signal handling.  bgpd's handlers assume
+ * the daemon's event loop and must not run in the child; in particular
+ * SIGALRM must be at SIG_DFL for the stall watchdog to be lethal.
+ * SIGPIPE alone keeps the daemon's SIG_IGN disposition so that a vanished
+ * vtysh surfaces as EPIPE on write() rather than killing the worker.
+ */
+static void bgp_show_worker_reset_signals(void)
+{
+	static const int sigs[] = { SIGHUP,  SIGINT,  SIGTERM, SIGUSR1,
+				    SIGUSR2, SIGALRM, SIGCHLD };
+	struct sigaction act;
+	sigset_t mask;
+	unsigned int i;
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = SIG_DFL;
+
+	for (i = 0; i < array_size(sigs); i++)
+		sigaction(sigs[i], &act, NULL);
+
+	sigemptyset(&mask);
+	sigprocmask(SIG_SETMASK, &mask, NULL);
+}
+
+#if defined(HAVE_FOPENCOOKIE) || defined(HAVE_FUNOPEN)
+/* stdio write hook for the worker's copy of the session socket.  Each
+ * byte accepted by the socket is proof of forward progress, so each
+ * successful write pushes the stall deadline out again; a worker that
+ * stops producing (or whose consumer stops draining) runs out the alarm
+ * and is terminated.
+ *
+ * The socket is non-blocking (a shared file-description flag the worker
+ * must not change, since the parent uses the same description), so wait
+ * for writability with poll() instead of blocking in write(); the alarm
+ * is not renewed while waiting, which is exactly what makes the watchdog
+ * bite on a consumer that stopped draining.
+ *
+ * Per fopencookie(3) a short return signals an error to stdio, which
+ * latches the stream's error flag; every later vty_out() on the stream
+ * then fails immediately without touching the socket, letting the render
+ * loop finish fast against a dead consumer.
+ */
+static ssize_t bgp_show_worker_write(void *cookie, const char *buf,
+				     size_t len)
+{
+	int fd = (int)(intptr_t)cookie;
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t nwritten = write(fd, buf + off, len - off);
+
+		if (nwritten < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				struct pollfd pfd = {
+					.fd = fd,
+					.events = POLLOUT,
+				};
+
+				poll(&pfd, 1, -1);
+				continue;
+			}
+			/* EPIPE (client went away) or a hard error: stop
+			 * renewing the watchdog and report the error up.
+			 */
+			return 0;
+		}
+		off += (size_t)nwritten;
+		alarm(BGP_SHOW_WORKER_STALL_SECS);
+	}
+
+	return (ssize_t)len;
+}
+#endif /* HAVE_FOPENCOOKIE || HAVE_FUNOPEN */
+
+#if !defined(HAVE_FOPENCOOKIE) && defined(HAVE_FUNOPEN)
+/* funopen(3) adapter for the BSDs: their writefn takes/returns int and
+ * reports errors as -1 rather than fopencookie's short count.
+ */
+static int bgp_show_worker_write_funopen(void *cookie, const char *buf,
+					 int len)
+{
+	if (bgp_show_worker_write(cookie, buf, (size_t)len) != (ssize_t)len)
+		return -1;
+	return len;
+}
+#endif /* !HAVE_FOPENCOOKIE && HAVE_FUNOPEN */
+
+/* Establish the worker runtime in a freshly forked child and return the
+ * stdio stream the renderer writes into, or NULL on failure.  Must be
+ * called immediately after fork(), before any daemon state is touched.
+ */
+static FILE *bgp_show_worker_begin(int fd)
+{
+	FILE *out;
+#ifdef HAVE_FOPENCOOKIE
+	cookie_io_functions_t io = { .write = bgp_show_worker_write };
+#endif
+
+	bgp_show_worker_close_fds(fd);
+	bgp_show_worker_reset_signals();
+
+	/* Rename so process-scanning health checks cannot mistake an
+	 * orphaned worker for the daemon itself.  Linux and the BSDs
+	 * rename different things: PR_SET_NAME changes the comm name that
+	 * a bare pgrep and top match (but not the ps argv line), while
+	 * setproctitle(3) changes the ps/top title (but not the accounting
+	 * name pgrep matches).  Each covers the check style native to its
+	 * platform.
+	 */
+#ifdef GNU_LINUX
+	prctl(PR_SET_NAME, "bgpd-show", 0, 0, 0);
+#elif defined(HAVE_SETPROCTITLE)
+	setproctitle("show worker");
+#endif
+
+	/* Route stdio through the renew-on-progress write hook. */
+#if defined(HAVE_FOPENCOOKIE)
+	out = fopencookie((void *)(intptr_t)fd, "w", io);
+#elif defined(HAVE_FUNOPEN)
+	out = funopen((void *)(intptr_t)fd, NULL,
+		      bgp_show_worker_write_funopen, NULL, NULL);
+#else
+	/* No way to hook writes on this platform: plain stdio and no stall
+	 * watchdog.  A fixed alarm here would cap total runtime instead of
+	 * inactivity and kill legitimately slow commands, which is worse
+	 * than a worker lingering until the client drains or exits.  Note
+	 * plain stdio also surfaces EAGAIN from the non-blocking session
+	 * socket as a stream error; such platforms should grow a write
+	 * hook before relying on this path.
+	 */
+	return fdopen(fd, "w");
+#endif
+
+	/* Arm the stall watchdog; also covers a worker that wedges before
+	 * its very first write.
+	 */
+	alarm(BGP_SHOW_WORKER_STALL_SECS);
+
+	return out;
+}
+
+/* typedef in bgp_route.h */
+
+struct bgp_show_args {
+	struct bgp *bgp;
+	afi_t afi;
+	safi_t safi;
+	enum bgp_show_type type;
+	void *output_arg;
+	uint16_t show_flags;
+	enum rpki_states rpki_target_state;
+	bool brief;
+};
+
+struct bgp_show_community_args {
+	struct bgp *bgp;
+	char *community;
+	int match;
+	afi_t afi;
+	safi_t safi;
+	uint16_t show_flags;
+};
+
+struct bgp_show_all_instances_routes_args {
+	afi_t afi;
+	safi_t safi;
+	uint16_t show_flags;
+};
+
+struct bgp_show_all_args {
+	char *community;
+	int match;
+	enum bgp_show_type type;
+	void *output_arg;
+	uint16_t show_flags;
+	enum rpki_states rpki_target_state;
+	bool brief;
+};
+
+static void bgp_show_all_instances_routes_vty(struct vty *vty, afi_t afi,
+					      safi_t safi, uint16_t show_flags);
+
+static int bgp_show_fork_run_bgp_show(struct vty *vty, void *arg)
+{
+	struct bgp_show_args *show = arg;
+
+	return bgp_show(vty, show->bgp, show->afi, show->safi, show->type,
+			show->output_arg, show->show_flags,
+			show->rpki_target_state, show->brief);
+}
+
+static int bgp_show_fork_run_community(struct vty *vty, void *arg)
+{
+	struct bgp_show_community_args *show = arg;
+
+	return bgp_show_community(vty, show->bgp, show->community, show->match,
+				      show->afi, show->safi, show->show_flags);
+}
+
+static int bgp_show_fork_run_all_instances_routes(struct vty *vty, void *arg)
+{
+	struct bgp_show_all_instances_routes_args *show = arg;
+
+	bgp_show_all_instances_routes_vty(vty, show->afi, show->safi,
+					  show->show_flags);
+	return CMD_SUCCESS;
+}
+
+static int bgp_show_fork_run_all(struct vty *vty, void *arg)
+{
+	struct bgp_show_all_args *show = arg;
+	struct listnode *node;
+	struct bgp *abgp;
+	afi_t afi;
+	safi_t safi;
+	bool first = true;
+	bool use_json = CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_JSON);
+
+	if (use_json)
+		vty_out(vty, "{\n");
+
+	if (CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_AFI_IP) ||
+	    CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_AFI_IP6)) {
+		afi = CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_AFI_IP) ? AFI_IP
+									    : AFI_IP6;
+		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
+			FOREACH_SAFI (safi) {
+				if (!bgp_afi_safi_peer_exists(abgp, afi, safi))
+					continue;
+
+				if (use_json) {
+					if (first)
+						first = false;
+					else
+						vty_out(vty, ",\n");
+					vty_out(vty, "\"%s\":{\n",
+						get_afi_safi_str(afi, safi, true));
+				} else
+					vty_out(vty, "\nFor address family: %s\n",
+						get_afi_safi_str(afi, safi, false));
+
+				if (show->community)
+					bgp_show_community(vty, abgp, show->community,
+							   show->match, afi, safi,
+							   show->show_flags);
+				else
+					bgp_show(vty, abgp, afi, safi, show->type,
+						 show->output_arg, show->show_flags,
+						 show->rpki_target_state, show->brief);
+				if (use_json)
+					vty_out(vty, "}\n");
+			}
+		}
+	} else {
+		/* show <ip> bgp all: for each AFI and SAFI */
+		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
+			FOREACH_AFI_SAFI (afi, safi) {
+				if (!bgp_afi_safi_peer_exists(abgp, afi, safi))
+					continue;
+
+				if (use_json) {
+					if (first)
+						first = false;
+					else
+						vty_out(vty, ",\n");
+
+					vty_out(vty, "\"%s\":{\n",
+						get_afi_safi_str(afi, safi, true));
+
+					/* Adding 'routes' key to make the json output format valid for evpn. */
+					if (safi == SAFI_EVPN)
+						vty_out(vty, "\"routes\":");
+
+				} else
+					vty_out(vty, "\nFor address family: %s\n",
+						get_afi_safi_str(afi, safi, false));
+
+				if (show->community)
+					bgp_show_community(vty, abgp, show->community,
+							   show->match, afi, safi,
+							   show->show_flags);
+				else
+					bgp_show(vty, abgp, afi, safi, show->type,
+						 show->output_arg, show->show_flags,
+						 show->rpki_target_state, show->brief);
+				if (use_json)
+					vty_out(vty, "}\n");
+			}
+		}
+	}
+
+	if (use_json)
+		vty_out(vty, "}\n");
+
+	return CMD_SUCCESS;
+}
+
+int bgp_show_fork_run(struct vty *vty, bgp_show_fork_func_t func, void *arg)
+{
+	struct bgp_show_worker *worker;
+	pid_t pid;
+
+	/* Only a vtysh session socket can carry a worker's direct writes.
+	 * Filters need the parent vty buffer.
+	 */
+	if (vty->type != VTY_SHELL_SERV || vty->filter)
+		return func(vty, arg);
+
+	/* If output from an earlier command is still being flushed, worker
+	 * bytes would interleave with it on the socket; run inline instead
+	 * (rare -- the client normally waits for the status marker before
+	 * sending the next command).
+	 */
+	if (event_is_scheduled(vty->t_write) || !buffer_empty(vty->obuf))
+		return func(vty, arg);
+
+	/* Refuse rather than degrade at the cap: running inline would block
+	 * the event loop (the reason this mechanism exists), and queueing
+	 * would silently hang the synchronous caller.
+	 */
+	if (bgp_show_workers_active >= bm->show_worker_max) {
+		/* Also log daemon-side: the refused client may be a scraper
+		 * that silently drops the error, and repeated refusals are
+		 * worth an operator's attention (long-running dumps or a
+		 * stalled client holding slots).
+		 */
+		zlog_warn("show command refused: %u show workers already running (max %u)",
+			  bgp_show_workers_active, bm->show_worker_max);
+		vty_out(vty,
+			"%% Too many BGP show workers already running (%u), try again later\n",
+			bgp_show_workers_active);
+		return CMD_WARNING;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		/* fork() failing means memory pressure or a process limit;
+		 * log it even if the client discards the error text.
+		 */
+		zlog_err("show command failed: fork: %m");
+		vty_out(vty, "%% Failed to fork show worker: %m\n");
+		return CMD_WARNING;
+	}
+
+	if (pid == 0) {
+		FILE *out;
+		struct vty child_vty = *vty;
+		int ret;
+
+		/* Strip the daemon copy down to a pure renderer: close
+		 * every inherited descriptor except the session socket,
+		 * reset signals, rename, arm the stall watchdog.  See
+		 * "Forked show workers" above.
+		 */
+		out = bgp_show_worker_begin(vty->wfd);
+		if (!out)
+			_exit(1);
+
+		/* Reuse the existing renderer unchanged, but point
+		 * vty_out() straight at the session socket.
+		 */
+		child_vty.type = VTY_SHELL;
+		child_vty.of = out;
+		child_vty.of_saved = NULL;
+		child_vty.status = VTY_NORMAL;
+		child_vty.pass_fd = -1;
+		/* The forked worker is synchronous; it must not reuse parent events. */
+		child_vty.frame_pos = 0;
+		child_vty.t_read = NULL;
+		child_vty.t_write = NULL;
+		child_vty.t_timeout = NULL;
+
+		ret = func(&child_vty, arg);
+		fflush(out);
+		fclose(out);
+		/* Only output bytes were written; the parent sends the
+		 * status marker after reaping us (see bgp_show_fork_reap).
+		 */
+		_exit(ret == CMD_SUCCESS ? 0 : 1);
+	}
+
+	worker = XCALLOC(MTYPE_BGP_SHOW_WORKER, sizeof(*worker));
+	worker->pid = pid;
+	worker->vty = vty;
+
+	/* Hold the command open: no status marker and no further reads on
+	 * this session until the reaper finalizes the exchange, and be told
+	 * if the session dies first.
+	 */
+	vty->defer_response = true;
+	vty->defer_close_cb = bgp_show_fork_vty_closed;
+	vty->defer_close_arg = worker;
+
+	bgp_show_workers_active++;
+	event_add_timer_msec(bm->master, bgp_show_fork_reap, worker, 100,
+			     NULL);
+	return CMD_SUCCESS;
+}
+
+static int bgp_show_forked(struct vty *vty, struct bgp *bgp, afi_t afi,
+				   safi_t safi, enum bgp_show_type type,
+				   void *output_arg, uint16_t show_flags,
+				   enum rpki_states rpki_target_state, bool brief)
+{
+	struct bgp_show_args args = {
+		.bgp = bgp,
+		.afi = afi,
+		.safi = safi,
+		.type = type,
+		.output_arg = output_arg,
+		.show_flags = show_flags,
+		.rpki_target_state = rpki_target_state,
+		.brief = brief,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_bgp_show, &args);
+}
+
+static int bgp_show_community_forked(struct vty *vty, struct bgp *bgp,
+				     char *community, int match, afi_t afi,
+				     safi_t safi, uint16_t show_flags)
+{
+	struct bgp_show_community_args args = {
+		.bgp = bgp,
+		.community = community,
+		.match = match,
+		.afi = afi,
+		.safi = safi,
+		.show_flags = show_flags,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_community, &args);
+}
+
+static int bgp_show_all_instances_routes_forked(struct vty *vty, afi_t afi,
+					       safi_t safi, uint16_t show_flags)
+{
+	struct bgp_show_all_instances_routes_args args = {
+		.afi = afi,
+		.safi = safi,
+		.show_flags = show_flags,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_all_instances_routes,
+				 &args);
+}
+
+static int bgp_show_all_forked(struct vty *vty, char *community, int match,
+				       enum bgp_show_type type, void *output_arg,
+				       uint16_t show_flags,
+				       enum rpki_states rpki_target_state, bool brief)
+{
+	struct bgp_show_all_args args = {
+		.community = community,
+		.match = match,
+		.type = type,
+		.output_arg = output_arg,
+		.show_flags = show_flags,
+		.rpki_target_state = rpki_target_state,
+		.brief = brief,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_all, &args);
+}
+
 static void bgp_show_all_instances_routes_vty(struct vty *vty, afi_t afi,
 					      safi_t safi, uint16_t show_flags)
 {
@@ -15488,7 +16181,6 @@ DEFPY(show_ip_bgp, show_ip_bgp_cmd,
 	int idx = 0;
 	int match_p = 0;
 	char *community = NULL;
-	bool first = true;
 	uint16_t show_flags = 0;
 	enum rpki_states rpki_target_state = RPKI_NOT_BEING_USED;
 	struct prefix p;
@@ -15680,112 +16372,24 @@ DEFPY(show_ip_bgp, show_ip_bgp_cmd,
 
 	if (!all) {
 		/* show bgp: AFI_IP6, show ip bgp: AFI_IP */
-		if (community)
-			return bgp_show_community(vty, bgp, community,
-						  match_p, afi, safi,
-						  show_flags);
+		if (community && (afi == AFI_IP || afi == AFI_IP6))
+			return bgp_show_community_forked(vty, bgp, community, match_p,
+						       afi, safi, show_flags);
+		else if (community)
+			return bgp_show_community(vty, bgp, community, match_p, afi,
+						  safi, show_flags);
+		else if (afi == AFI_IP || afi == AFI_IP6 ||
+			 CHECK_FLAG(show_flags, BGP_SHOW_OPT_ROUTES_DETAIL))
+			return bgp_show_forked(vty, bgp, afi, safi, sh_type,
+						       output_arg, show_flags,
+						       rpki_target_state, brief);
 		else
 			return bgp_show(vty, bgp, afi, safi, sh_type, output_arg, show_flags,
 					rpki_target_state, brief);
-	} else {
-		struct listnode *node;
-		struct bgp *abgp;
-		/* show <ip> bgp ipv4 all: AFI_IP, show <ip> bgp ipv6 all:
-		 * AFI_IP6 */
-
-		if (uj)
-			vty_out(vty, "{\n");
-
-		if (CHECK_FLAG(show_flags, BGP_SHOW_OPT_AFI_IP)
-		    || CHECK_FLAG(show_flags, BGP_SHOW_OPT_AFI_IP6)) {
-			afi = CHECK_FLAG(show_flags, BGP_SHOW_OPT_AFI_IP)
-				      ? AFI_IP
-				      : AFI_IP6;
-			for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
-				FOREACH_SAFI (safi) {
-					if (!bgp_afi_safi_peer_exists(abgp, afi,
-								      safi))
-						continue;
-
-					if (uj) {
-						if (first)
-							first = false;
-						else
-							vty_out(vty, ",\n");
-						vty_out(vty, "\"%s\":{\n",
-							get_afi_safi_str(afi,
-									 safi,
-									 true));
-					} else
-						vty_out(vty,
-							"\nFor address family: %s\n",
-							get_afi_safi_str(
-								afi, safi,
-								false));
-
-					if (community)
-						bgp_show_community(
-							vty, abgp, community,
-							match_p, afi, safi,
-							show_flags);
-					else
-						bgp_show(vty, abgp, afi, safi, sh_type, output_arg,
-							 show_flags, rpki_target_state, brief);
-					if (uj)
-						vty_out(vty, "}\n");
-				}
-			}
-		} else {
-			/* show <ip> bgp all: for each AFI and SAFI*/
-			for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
-				FOREACH_AFI_SAFI (afi, safi) {
-					if (!bgp_afi_safi_peer_exists(abgp, afi,
-								      safi))
-						continue;
-
-					if (uj) {
-						if (first)
-							first = false;
-						else
-							vty_out(vty, ",\n");
-
-						vty_out(vty, "\"%s\":{\n",
-							get_afi_safi_str(afi,
-									 safi,
-									 true));
-
-						/* Adding 'routes' key to make
-						 * the json output format valid
-						 * for evpn
-						 */
-						if (safi == SAFI_EVPN)
-							vty_out(vty,
-								"\"routes\":");
-
-					} else
-						vty_out(vty,
-							"\nFor address family: %s\n",
-							get_afi_safi_str(
-								afi, safi,
-								false));
-
-					if (community)
-						bgp_show_community(
-							vty, abgp, community,
-							match_p, afi, safi,
-							show_flags);
-					else
-						bgp_show(vty, abgp, afi, safi, sh_type, output_arg,
-							 show_flags, rpki_target_state, brief);
-					if (uj)
-						vty_out(vty, "}\n");
-				}
-			}
-		}
-		if (uj)
-			vty_out(vty, "}\n");
 	}
-	return CMD_SUCCESS;
+
+	return bgp_show_all_forked(vty, community, match_p, sh_type, output_arg,
+				       show_flags, rpki_target_state, brief);
 }
 
 DEFUN (show_bgp_link_state_route,
@@ -17926,8 +18530,9 @@ static int bgp_show_neighbor_route(struct vty *vty, struct peer *peer, afi_t afi
 	if (safi == SAFI_LABELED_UNICAST)
 		safi = SAFI_UNICAST;
 
-	return bgp_show(vty, peer->bgp, afi, safi, type, &peer->connection->su, show_flags,
-			RPKI_NOT_BEING_USED, brief);
+	return bgp_show_forked(vty, peer->bgp, afi, safi, type,
+			       &peer->connection->su, show_flags,
+			       RPKI_NOT_BEING_USED, brief);
 }
 
 /*
@@ -17961,13 +18566,13 @@ DEFPY(show_ip_bgp_vrf_afi_safi_routes_detailed,
 		return CMD_WARNING;
 	/* 'vrf all' case to iterate all vrfs & show output per vrf instance */
 	if (vrf_name && strmatch(vrf_name, "all")) {
-		bgp_show_all_instances_routes_vty(vty, afi, safi, show_flags);
-		return CMD_SUCCESS;
+		return bgp_show_all_instances_routes_forked(vty, afi, safi,
+							 show_flags);
 	}
 
 	/* All other cases except vrf all */
-	return bgp_show(vty, bgp, afi, safi, bgp_show_type_detail, NULL, show_flags,
-			RPKI_NOT_BEING_USED, false);
+	return bgp_show_forked(vty, bgp, afi, safi, bgp_show_type_detail, NULL,
+			       show_flags, RPKI_NOT_BEING_USED, false);
 }
 
 DEFPY (show_ip_bgp_neighbor_routes,

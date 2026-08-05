@@ -178,6 +178,25 @@ struct vty {
 	/* CLI command return value (likely CMD_SUCCESS) when pass_fd != -1 */
 	uint8_t pass_fd_status[4];
 
+	/* The response to the current CLI command is owned by an
+	 * out-of-band writer (e.g. a process forked by the daemon that
+	 * writes the command output to the session socket itself).  When
+	 * set, the status marker that normally completes the command is
+	 * not sent when the handler returns and reading is suspended; the
+	 * daemon finishes the exchange later via vty_resume_response().
+	 * One-shot: cleared as soon as the current command is dispatched.
+	 */
+	bool defer_response;
+
+	/* Invoked (once) from vty_close() if this session dies while a
+	 * deferred response is still pending, so the deferring code can
+	 * drop its reference to this vty instead of resuming into freed
+	 * memory.  Cleared by the deferring code right before it calls
+	 * vty_resume_response().
+	 */
+	void (*defer_close_cb)(struct vty *vty, void *arg);
+	void *defer_close_arg;
+
 	/* live logging target / terminal monitor */
 	struct zlog_live_cfg live_log;
 

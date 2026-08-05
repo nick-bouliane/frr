@@ -193,6 +193,11 @@ extern int bgp_show_summary_vty(struct vty *vty, const char *name, afi_t afi,
 				safi_t safi, const char *neighbor,
 				enum peer_asn_type as_type, as_t as,
 				uint16_t show_flags);
+extern int bgp_show_summary_vty_forked(struct vty *vty, const char *name,
+				       afi_t afi, safi_t safi,
+				       const char *neighbor,
+				       enum peer_asn_type as_type, as_t as,
+				       uint16_t show_flags);
 extern bool peergroup_flag_check(struct peer *peer, uint64_t flag);
 extern bool peergroup_af_flag_check(struct peer *peer, afi_t afi, safi_t safi,
 				    uint64_t flag);
