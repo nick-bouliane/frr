@@ -6,6 +6,7 @@
 
 #include <zebra.h>
 #include <math.h>
+#include <sys/wait.h>
 
 #include "bgpd/bgp_addpath_types.h"
 #include "printfrr.h"
@@ -22,6 +23,7 @@
 #include "sockunion.h"
 #include "plist.h"
 #include "frrevent.h"
+#include "network.h"
 #include "workqueue.h"
 #include "queue.h"
 #include "memory.h"
@@ -15530,6 +15532,308 @@ static int bgp_show(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 			      &json_header_depth, show_flags, rpki_target_state, brief);
 }
 
+static void bgp_show_fork_reap(struct event *event)
+{
+	pid_t pid = (pid_t)(uintptr_t)EVENT_ARG(event);
+	int status;
+	pid_t ret;
+
+	/* Reap only the show worker we created; do not disturb other children. */
+	do {
+		ret = waitpid(pid, &status, WNOHANG);
+	} while (ret < 0 && errno == EINTR);
+
+	/* The show worker may still be writing to vtysh. Poll without blocking bgpd. */
+	if (ret == 0)
+		event_add_timer_msec(bm->master, bgp_show_fork_reap,
+				     (void *)(uintptr_t)pid, 100, NULL);
+}
+
+typedef int (*bgp_show_fork_func_t)(struct vty *vty, void *arg);
+
+struct bgp_show_args {
+	struct bgp *bgp;
+	afi_t afi;
+	safi_t safi;
+	enum bgp_show_type type;
+	void *output_arg;
+	uint16_t show_flags;
+	enum rpki_states rpki_target_state;
+	bool brief;
+};
+
+struct bgp_show_community_args {
+	struct bgp *bgp;
+	char *community;
+	int match;
+	afi_t afi;
+	safi_t safi;
+	uint16_t show_flags;
+};
+
+struct bgp_show_all_instances_routes_args {
+	afi_t afi;
+	safi_t safi;
+	uint16_t show_flags;
+};
+
+struct bgp_show_all_args {
+	char *community;
+	int match;
+	enum bgp_show_type type;
+	void *output_arg;
+	uint16_t show_flags;
+	enum rpki_states rpki_target_state;
+	bool brief;
+};
+
+static void bgp_show_all_instances_routes_vty(struct vty *vty, afi_t afi,
+					      safi_t safi, uint16_t show_flags);
+
+static int bgp_show_fork_run_bgp_show(struct vty *vty, void *arg)
+{
+	struct bgp_show_args *show = arg;
+
+	return bgp_show(vty, show->bgp, show->afi, show->safi, show->type,
+			show->output_arg, show->show_flags,
+			show->rpki_target_state, show->brief);
+}
+
+static int bgp_show_fork_run_community(struct vty *vty, void *arg)
+{
+	struct bgp_show_community_args *show = arg;
+
+	return bgp_show_community(vty, show->bgp, show->community, show->match,
+				      show->afi, show->safi, show->show_flags);
+}
+
+static int bgp_show_fork_run_all_instances_routes(struct vty *vty, void *arg)
+{
+	struct bgp_show_all_instances_routes_args *show = arg;
+
+	bgp_show_all_instances_routes_vty(vty, show->afi, show->safi,
+					  show->show_flags);
+	return CMD_SUCCESS;
+}
+
+static int bgp_show_fork_run_all(struct vty *vty, void *arg)
+{
+	struct bgp_show_all_args *show = arg;
+	struct listnode *node;
+	struct bgp *abgp;
+	afi_t afi;
+	safi_t safi;
+	bool first = true;
+	bool use_json = CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_JSON);
+
+	if (use_json)
+		vty_out(vty, "{\n");
+
+	if (CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_AFI_IP) ||
+	    CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_AFI_IP6)) {
+		afi = CHECK_FLAG(show->show_flags, BGP_SHOW_OPT_AFI_IP) ? AFI_IP
+									    : AFI_IP6;
+		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
+			FOREACH_SAFI (safi) {
+				if (!bgp_afi_safi_peer_exists(abgp, afi, safi))
+					continue;
+
+				if (use_json) {
+					if (first)
+						first = false;
+					else
+						vty_out(vty, ",\n");
+					vty_out(vty, "\"%s\":{\n",
+						get_afi_safi_str(afi, safi, true));
+				} else
+					vty_out(vty, "\nFor address family: %s\n",
+						get_afi_safi_str(afi, safi, false));
+
+				if (show->community)
+					bgp_show_community(vty, abgp, show->community,
+							   show->match, afi, safi,
+							   show->show_flags);
+				else
+					bgp_show(vty, abgp, afi, safi, show->type,
+						 show->output_arg, show->show_flags,
+						 show->rpki_target_state, show->brief);
+				if (use_json)
+					vty_out(vty, "}\n");
+			}
+		}
+	} else {
+		/* show <ip> bgp all: for each AFI and SAFI */
+		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
+			FOREACH_AFI_SAFI (afi, safi) {
+				if (!bgp_afi_safi_peer_exists(abgp, afi, safi))
+					continue;
+
+				if (use_json) {
+					if (first)
+						first = false;
+					else
+						vty_out(vty, ",\n");
+
+					vty_out(vty, "\"%s\":{\n",
+						get_afi_safi_str(afi, safi, true));
+
+					/* Adding 'routes' key to make the json output format valid for evpn. */
+					if (safi == SAFI_EVPN)
+						vty_out(vty, "\"routes\":");
+
+				} else
+					vty_out(vty, "\nFor address family: %s\n",
+						get_afi_safi_str(afi, safi, false));
+
+				if (show->community)
+					bgp_show_community(vty, abgp, show->community,
+							   show->match, afi, safi,
+							   show->show_flags);
+				else
+					bgp_show(vty, abgp, afi, safi, show->type,
+						 show->output_arg, show->show_flags,
+						 show->rpki_target_state, show->brief);
+				if (use_json)
+					vty_out(vty, "}\n");
+			}
+		}
+	}
+
+	if (use_json)
+		vty_out(vty, "}\n");
+
+	return CMD_SUCCESS;
+}
+
+static int bgp_show_fork_run(struct vty *vty, bgp_show_fork_func_t func,
+				     void *arg)
+{
+	int pipefd[2];
+	pid_t pid;
+
+	/* Only vtysh can receive a passed fd. Filters need the parent vty buffer. */
+	if (vty->type != VTY_SHELL_SERV || vty->filter)
+		return func(vty, arg);
+
+	if (pipe(pipefd) < 0) {
+		vty_out(vty, "%% Failed to create show output pipe: %m\n");
+		return CMD_WARNING;
+	}
+
+	set_cloexec(pipefd[0]);
+	set_cloexec(pipefd[1]);
+
+	pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		vty_out(vty, "%% Failed to fork show worker: %m\n");
+		return CMD_WARNING;
+	}
+
+	if (pid == 0) {
+		FILE *out;
+		struct vty child_vty = *vty;
+		int ret;
+
+		close(pipefd[0]);
+		out = fdopen(pipefd[1], "w");
+		if (!out)
+			_exit(1);
+
+		/* Reuse the existing renderer unchanged, but redirect vty_out() to the pipe. */
+		child_vty.type = VTY_SHELL;
+		child_vty.of = out;
+		child_vty.of_saved = NULL;
+		child_vty.status = VTY_NORMAL;
+		child_vty.pass_fd = -1;
+		/* The forked worker is synchronous; it must not reuse parent events. */
+		child_vty.frame_pos = 0;
+		child_vty.t_read = NULL;
+		child_vty.t_write = NULL;
+		child_vty.t_timeout = NULL;
+
+		ret = func(&child_vty, arg);
+		fflush(out);
+		fclose(out);
+		_exit(ret == CMD_SUCCESS ? 0 : 1);
+	}
+
+	close(pipefd[1]);
+	/* vtysh drains the read side directly, keeping bgpd out of the output path. */
+	vty_pass_fd(vty, pipefd[0]);
+	/* The child exits independently after output is drained; clean it up later. */
+	event_add_timer_msec(bm->master, bgp_show_fork_reap,
+			     (void *)(uintptr_t)pid, 100, NULL);
+	return CMD_SUCCESS;
+}
+
+static int bgp_show_forked(struct vty *vty, struct bgp *bgp, afi_t afi,
+				   safi_t safi, enum bgp_show_type type,
+				   void *output_arg, uint16_t show_flags,
+				   enum rpki_states rpki_target_state, bool brief)
+{
+	struct bgp_show_args args = {
+		.bgp = bgp,
+		.afi = afi,
+		.safi = safi,
+		.type = type,
+		.output_arg = output_arg,
+		.show_flags = show_flags,
+		.rpki_target_state = rpki_target_state,
+		.brief = brief,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_bgp_show, &args);
+}
+
+static int bgp_show_community_forked(struct vty *vty, struct bgp *bgp,
+				     char *community, int match, afi_t afi,
+				     safi_t safi, uint16_t show_flags)
+{
+	struct bgp_show_community_args args = {
+		.bgp = bgp,
+		.community = community,
+		.match = match,
+		.afi = afi,
+		.safi = safi,
+		.show_flags = show_flags,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_community, &args);
+}
+
+static int bgp_show_all_instances_routes_forked(struct vty *vty, afi_t afi,
+					       safi_t safi, uint16_t show_flags)
+{
+	struct bgp_show_all_instances_routes_args args = {
+		.afi = afi,
+		.safi = safi,
+		.show_flags = show_flags,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_all_instances_routes,
+				 &args);
+}
+
+static int bgp_show_all_forked(struct vty *vty, char *community, int match,
+				       enum bgp_show_type type, void *output_arg,
+				       uint16_t show_flags,
+				       enum rpki_states rpki_target_state, bool brief)
+{
+	struct bgp_show_all_args args = {
+		.community = community,
+		.match = match,
+		.type = type,
+		.output_arg = output_arg,
+		.show_flags = show_flags,
+		.rpki_target_state = rpki_target_state,
+		.brief = brief,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_all, &args);
+}
+
 static void bgp_show_all_instances_routes_vty(struct vty *vty, afi_t afi,
 					      safi_t safi, uint16_t show_flags)
 {
@@ -16570,7 +16874,6 @@ DEFPY(show_ip_bgp, show_ip_bgp_cmd,
 	int idx = 0;
 	int match_p = 0;
 	char *community = NULL;
-	bool first = true;
 	uint16_t show_flags = 0;
 	enum rpki_states rpki_target_state = RPKI_NOT_BEING_USED;
 	struct prefix p;
@@ -16762,112 +17065,24 @@ DEFPY(show_ip_bgp, show_ip_bgp_cmd,
 
 	if (!all) {
 		/* show bgp: AFI_IP6, show ip bgp: AFI_IP */
-		if (community)
-			return bgp_show_community(vty, bgp, community,
-						  match_p, afi, safi,
-						  show_flags);
+		if (community && (afi == AFI_IP || afi == AFI_IP6))
+			return bgp_show_community_forked(vty, bgp, community, match_p,
+						       afi, safi, show_flags);
+		else if (community)
+			return bgp_show_community(vty, bgp, community, match_p, afi,
+						  safi, show_flags);
+		else if (afi == AFI_IP || afi == AFI_IP6 ||
+			 CHECK_FLAG(show_flags, BGP_SHOW_OPT_ROUTES_DETAIL))
+			return bgp_show_forked(vty, bgp, afi, safi, sh_type,
+						       output_arg, show_flags,
+						       rpki_target_state, brief);
 		else
 			return bgp_show(vty, bgp, afi, safi, sh_type, output_arg, show_flags,
 					rpki_target_state, brief);
-	} else {
-		struct listnode *node;
-		struct bgp *abgp;
-		/* show <ip> bgp ipv4 all: AFI_IP, show <ip> bgp ipv6 all:
-		 * AFI_IP6 */
-
-		if (uj)
-			vty_out(vty, "{\n");
-
-		if (CHECK_FLAG(show_flags, BGP_SHOW_OPT_AFI_IP)
-		    || CHECK_FLAG(show_flags, BGP_SHOW_OPT_AFI_IP6)) {
-			afi = CHECK_FLAG(show_flags, BGP_SHOW_OPT_AFI_IP)
-				      ? AFI_IP
-				      : AFI_IP6;
-			for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
-				FOREACH_SAFI (safi) {
-					if (!bgp_afi_safi_peer_exists(abgp, afi,
-								      safi))
-						continue;
-
-					if (uj) {
-						if (first)
-							first = false;
-						else
-							vty_out(vty, ",\n");
-						vty_out(vty, "\"%s\":{\n",
-							get_afi_safi_str(afi,
-									 safi,
-									 true));
-					} else
-						vty_out(vty,
-							"\nFor address family: %s\n",
-							get_afi_safi_str(
-								afi, safi,
-								false));
-
-					if (community)
-						bgp_show_community(
-							vty, abgp, community,
-							match_p, afi, safi,
-							show_flags);
-					else
-						bgp_show(vty, abgp, afi, safi, sh_type, output_arg,
-							 show_flags, rpki_target_state, brief);
-					if (uj)
-						vty_out(vty, "}\n");
-				}
-			}
-		} else {
-			/* show <ip> bgp all: for each AFI and SAFI*/
-			for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, abgp)) {
-				FOREACH_AFI_SAFI (afi, safi) {
-					if (!bgp_afi_safi_peer_exists(abgp, afi,
-								      safi))
-						continue;
-
-					if (uj) {
-						if (first)
-							first = false;
-						else
-							vty_out(vty, ",\n");
-
-						vty_out(vty, "\"%s\":{\n",
-							get_afi_safi_str(afi,
-									 safi,
-									 true));
-
-						/* Adding 'routes' key to make
-						 * the json output format valid
-						 * for evpn
-						 */
-						if (safi == SAFI_EVPN)
-							vty_out(vty,
-								"\"routes\":");
-
-					} else
-						vty_out(vty,
-							"\nFor address family: %s\n",
-							get_afi_safi_str(
-								afi, safi,
-								false));
-
-					if (community)
-						bgp_show_community(
-							vty, abgp, community,
-							match_p, afi, safi,
-							show_flags);
-					else
-						bgp_show(vty, abgp, afi, safi, sh_type, output_arg,
-							 show_flags, rpki_target_state, brief);
-					if (uj)
-						vty_out(vty, "}\n");
-				}
-			}
-		}
-		if (uj)
-			vty_out(vty, "}\n");
 	}
-	return CMD_SUCCESS;
+
+	return bgp_show_all_forked(vty, community, match_p, sh_type, output_arg,
+				       show_flags, rpki_target_state, brief);
 }
 
 DEFUN (show_bgp_link_state_route,
@@ -19034,8 +19249,9 @@ static int bgp_show_neighbor_route(struct vty *vty, struct peer *peer, afi_t afi
 	if (safi == SAFI_LABELED_UNICAST)
 		safi = SAFI_UNICAST;
 
-	return bgp_show(vty, peer->bgp, afi, safi, type, &peer->connection->su, show_flags,
-			RPKI_NOT_BEING_USED, brief);
+	return bgp_show_forked(vty, peer->bgp, afi, safi, type,
+			       &peer->connection->su, show_flags,
+			       RPKI_NOT_BEING_USED, brief);
 }
 
 /*
@@ -19069,13 +19285,13 @@ DEFPY(show_ip_bgp_vrf_afi_safi_routes_detailed,
 		return CMD_WARNING;
 	/* 'vrf all' case to iterate all vrfs & show output per vrf instance */
 	if (vrf_name && strmatch(vrf_name, "all")) {
-		bgp_show_all_instances_routes_vty(vty, afi, safi, show_flags);
-		return CMD_SUCCESS;
+		return bgp_show_all_instances_routes_forked(vty, afi, safi,
+							 show_flags);
 	}
 
 	/* All other cases except vrf all */
-	return bgp_show(vty, bgp, afi, safi, bgp_show_type_detail, NULL, show_flags,
-			RPKI_NOT_BEING_USED, false);
+	return bgp_show_forked(vty, bgp, afi, safi, bgp_show_type_detail, NULL,
+			       show_flags, RPKI_NOT_BEING_USED, false);
 }
 
 DEFPY (show_ip_bgp_neighbor_routes,
