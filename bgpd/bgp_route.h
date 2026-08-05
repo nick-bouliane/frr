@@ -1135,4 +1135,9 @@ extern int bgp_dest_set_defer_flag(struct bgp_dest *dest, bool delete);
 extern void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, safi_t safi);
 extern uint32_t bgp_path_info_get_srte_color(struct bgp_path_info *bpi);
 extern uint64_t bgp_path_info_get_link_bw(struct bgp_path_info *bpi);
+
+typedef int (*bgp_show_fork_func_t)(struct vty *vty, void *arg);
+extern int bgp_show_fork_run(struct vty *vty, bgp_show_fork_func_t func,
+			     void *arg);
+
 #endif /* _QUAGGA_BGP_ROUTE_H */

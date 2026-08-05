@@ -218,6 +218,29 @@ static ssize_t vtysh_client_receive(struct vtysh_client *vclient, char *buf,
 	return ret;
 }
 
+static void vtysh_client_drain_pass_fd(int fd)
+{
+	char buf[4096];
+
+	while (true) {
+		ssize_t nread;
+
+		nread = read(fd, buf, sizeof(buf));
+		if (nread > 0) {
+			if (gvty->of)
+				vty_out(gvty, "%.*s", (int)nread, buf);
+			continue;
+		}
+
+		if (nread < 0 && errno == EINTR)
+			continue;
+
+		break;
+	}
+
+	close(fd);
+}
+
 /*
  * Send a CLI command to a client and read the response.
  *
@@ -250,6 +273,8 @@ static int vtysh_client_run(struct vtysh_client *vclient, const char *line,
 	size_t bufsz = sizeof(stackbuf);
 	char *bufvalid, *end = NULL;
 	char terminator[3] = {0, 0, 0};
+	int drain_fd = -1;
+	int *receive_pass_fd = pass_fd ? pass_fd : &drain_fd;
 
 	/* vclinet was previously active, try to reconnect */
 	if (vclient->fd == VTYSH_WAS_ACTIVE) {
@@ -278,8 +303,9 @@ static int vtysh_client_run(struct vtysh_client *vclient, const char *line,
 	do {
 		ssize_t nread;
 
-		nread = vtysh_client_receive(
-			vclient, bufvalid, buf + bufsz - bufvalid - 1, pass_fd);
+		nread = vtysh_client_receive(vclient, bufvalid,
+					      buf + bufsz - bufvalid - 1,
+					      receive_pass_fd);
 
 		if (nread <= 0) {
 			if (gvty->of)
@@ -403,6 +429,8 @@ out_err:
 	vclient_close(vclient);
 	ret = CMD_SUCCESS;
 out:
+	if (drain_fd != -1)
+		vtysh_client_drain_pass_fd(drain_fd);
 	if (buf != stackbuf)
 		XFREE(MTYPE_TMP, buf);
 	return ret;

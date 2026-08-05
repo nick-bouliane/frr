@@ -15291,6 +15291,42 @@ int bgp_show_summary_vty(struct vty *vty, const char *name, afi_t afi,
 	return CMD_SUCCESS;
 }
 
+struct bgp_show_summary_fork_args {
+	const char *vrf;
+	afi_t afi;
+	safi_t safi;
+	const char *neighbor;
+	enum peer_asn_type as_type;
+	as_t as;
+	uint16_t show_flags;
+};
+
+static int bgp_show_fork_run_summary(struct vty *vty, void *arg)
+{
+	struct bgp_show_summary_fork_args *s = arg;
+
+	return bgp_show_summary_vty(vty, s->vrf, s->afi, s->safi, s->neighbor,
+				    s->as_type, s->as, s->show_flags);
+}
+
+int bgp_show_summary_vty_forked(struct vty *vty, const char *name, afi_t afi,
+				safi_t safi, const char *neighbor,
+				enum peer_asn_type as_type, as_t as,
+				uint16_t show_flags)
+{
+	struct bgp_show_summary_fork_args args = {
+		.vrf = name,
+		.afi = afi,
+		.safi = safi,
+		.neighbor = neighbor,
+		.as_type = as_type,
+		.as = as,
+		.show_flags = show_flags,
+	};
+
+	return bgp_show_fork_run(vty, bgp_show_fork_run_summary, &args);
+}
+
 /* `show [ip] bgp summary' commands. */
 DEFPY(show_ip_bgp_summary, show_ip_bgp_summary_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR
@@ -15367,8 +15403,8 @@ DEFPY(show_ip_bgp_summary, show_ip_bgp_summary_cmd,
 	if (argv_find(argv, argc, "json", &idx))
 		SET_FLAG(show_flags, BGP_SHOW_OPT_JSON);
 
-	return bgp_show_summary_vty(vty, vrf, afi, safi, neighbor, as_type, as,
-				    show_flags);
+	return bgp_show_summary_vty_forked(vty, vrf, afi, safi, neighbor,
+					   as_type, as, show_flags);
 }
 
 const char *get_afi_safi_str(afi_t afi, safi_t safi, bool for_json)
