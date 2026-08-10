@@ -85,6 +85,12 @@ module frr-bgp-route-map {
       "Match portion of routes defined by percentage value";
   }
 
+  identity nexthop-fanout {
+    base frr-route-map:rmap-match-type;
+    description
+      "Match deterministic percentage of peer/nexthop pairs";
+  }
+
   identity source-vrf {
     base frr-route-map:rmap-match-type;
     description
@@ -714,6 +720,15 @@ identity set-extcommunity-color {
         }
         description
           "Specifies the probability of applying the route-map";
+      }
+    }
+
+    case nexthop-fanout {
+      when "derived-from-or-self(../frr-route-map:condition, 'frr-bgp-route-map:nexthop-fanout')";
+      leaf nexthop-fanout {
+        type string;
+        description
+          "Specifies the deterministic peer/nexthop fanout threshold and total T2 count";
       }
     }
 

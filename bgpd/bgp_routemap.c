@@ -5,6 +5,8 @@
 
 #include <zebra.h>
 
+#include <ctype.h>
+
 #include "prefix.h"
 #include "filter.h"
 #include "routemap.h"
@@ -2122,6 +2124,301 @@ static const struct route_map_rule_cmd route_match_probability_cmd = {
 	route_match_probability,
 	route_match_probability_compile,
 	route_match_probability_free
+};
+
+struct nexthop_fanout_match {
+	uint32_t threshold;
+	uint32_t total_t2s;
+};
+
+#define NEXTHOP_FANOUT_XXH32_PRIME1 2654435761U
+#define NEXTHOP_FANOUT_XXH32_PRIME2 2246822519U
+#define NEXTHOP_FANOUT_XXH32_PRIME3 3266489917U
+#define NEXTHOP_FANOUT_XXH32_PRIME4 668265263U
+#define NEXTHOP_FANOUT_XXH32_PRIME5 374761393U
+
+static uint32_t nexthop_fanout_xxh32_rotl32(uint32_t value, unsigned int count)
+{
+	return (value << count) | (value >> (32 - count));
+}
+
+static uint32_t nexthop_fanout_xxh32_load32le(const void *ptr)
+{
+	const uint8_t *bytes = ptr;
+
+	return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+	       ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static uint32_t nexthop_fanout_xxh32_round(uint32_t acc, uint32_t input)
+{
+	acc += input * NEXTHOP_FANOUT_XXH32_PRIME2;
+	acc = nexthop_fanout_xxh32_rotl32(acc, 13);
+	acc *= NEXTHOP_FANOUT_XXH32_PRIME1;
+
+	return acc;
+}
+
+static uint32_t nexthop_fanout_xxh32_avalanche(uint32_t hash)
+{
+	hash ^= hash >> 15;
+	hash *= NEXTHOP_FANOUT_XXH32_PRIME2;
+	hash ^= hash >> 13;
+	hash *= NEXTHOP_FANOUT_XXH32_PRIME3;
+	hash ^= hash >> 16;
+
+	return hash;
+}
+
+static uint32_t nexthop_fanout_xxh32(const void *input, size_t length,
+				     uint32_t seed)
+{
+	const uint8_t *ptr = input;
+	const uint8_t *end = ptr + length;
+	uint32_t hash;
+
+	if (length >= 16) {
+		const uint8_t *limit = end - 16;
+		uint32_t v1 = seed + NEXTHOP_FANOUT_XXH32_PRIME1 +
+			      NEXTHOP_FANOUT_XXH32_PRIME2;
+		uint32_t v2 = seed + NEXTHOP_FANOUT_XXH32_PRIME2;
+		uint32_t v3 = seed;
+		uint32_t v4 = seed - NEXTHOP_FANOUT_XXH32_PRIME1;
+
+		do {
+			v1 = nexthop_fanout_xxh32_round(
+				v1, nexthop_fanout_xxh32_load32le(ptr));
+			ptr += 4;
+			v2 = nexthop_fanout_xxh32_round(
+				v2, nexthop_fanout_xxh32_load32le(ptr));
+			ptr += 4;
+			v3 = nexthop_fanout_xxh32_round(
+				v3, nexthop_fanout_xxh32_load32le(ptr));
+			ptr += 4;
+			v4 = nexthop_fanout_xxh32_round(
+				v4, nexthop_fanout_xxh32_load32le(ptr));
+			ptr += 4;
+		} while (ptr <= limit);
+
+		hash = nexthop_fanout_xxh32_rotl32(v1, 1) +
+		       nexthop_fanout_xxh32_rotl32(v2, 7) +
+		       nexthop_fanout_xxh32_rotl32(v3, 12) +
+		       nexthop_fanout_xxh32_rotl32(v4, 18);
+	} else {
+		hash = seed + NEXTHOP_FANOUT_XXH32_PRIME5;
+	}
+
+	hash += length;
+
+	while (ptr + 4 <= end) {
+		hash += nexthop_fanout_xxh32_load32le(ptr) *
+			NEXTHOP_FANOUT_XXH32_PRIME3;
+		hash = nexthop_fanout_xxh32_rotl32(hash, 17) *
+		       NEXTHOP_FANOUT_XXH32_PRIME4;
+		ptr += 4;
+	}
+
+	while (ptr < end) {
+		hash += *ptr * NEXTHOP_FANOUT_XXH32_PRIME5;
+		hash = nexthop_fanout_xxh32_rotl32(hash, 11) *
+		       NEXTHOP_FANOUT_XXH32_PRIME1;
+		ptr++;
+	}
+
+	return nexthop_fanout_xxh32_avalanche(hash);
+}
+
+static bool nexthop_fanout_addr_is_zero(const void *addr, size_t addrlen)
+{
+	const uint8_t *bytes = addr;
+	size_t i;
+
+	for (i = 0; i < addrlen; i++) {
+		if (bytes[i] != 0)
+			return false;
+	}
+
+	return true;
+}
+
+static bool nexthop_fanout_hash_prefix(const struct prefix *prefix,
+				       uint32_t *key)
+{
+	const struct prefix_evpn *evp;
+	const struct evpn_prefix_addr *evpn_prefix;
+	const void *addr;
+	uint8_t pfx_addr[IPV6_MAX_BYTELEN] = {};
+	uint8_t prefix_key[3];
+	size_t prefix_addrlen;
+	uint16_t prefixlen;
+	int family;
+	int max_addrlen;
+
+	if (!prefix || !key)
+		return false;
+
+	if (prefix->family == AF_EVPN) {
+		evp = (const struct prefix_evpn *)prefix;
+		if (evp->prefix.route_type != BGP_EVPN_IP_PREFIX_ROUTE ||
+		    is_evpn_prefix_ipaddr_none(evp))
+			return false;
+
+		evpn_prefix = &evp->prefix.prefix_addr;
+		family = ipaddr_family(&evpn_prefix->ip);
+		max_addrlen = IPADDRSZ(&evpn_prefix->ip);
+		if (evpn_prefix->ip_prefix_length > BSIZE(max_addrlen))
+			return false;
+
+		addr = evpn_prefix->ip.ip.addrbytes;
+		prefixlen = evpn_prefix->ip_prefix_length;
+		prefix_key[0] = family;
+		prefix_key[1] = 0;
+		prefix_key[2] = prefixlen;
+	} else {
+		max_addrlen = prefix_blen(prefix);
+		if (max_addrlen <= 0 ||
+		    prefix->prefixlen > (uint16_t)BSIZE(max_addrlen))
+			return false;
+
+		addr = &prefix->u.prefix;
+		prefixlen = prefix->prefixlen;
+		prefix_key[0] = prefix->family;
+		prefix_key[1] = prefixlen >> 8;
+		prefix_key[2] = prefixlen & 0xff;
+	}
+
+	if (!addr || max_addrlen > (int)sizeof(pfx_addr))
+		return false;
+
+	*key = nexthop_fanout_xxh32(prefix_key, sizeof(prefix_key), *key);
+
+	prefix_addrlen = PSIZE(prefixlen);
+	memcpy(pfx_addr, addr, prefix_addrlen);
+	if (prefixlen % 8)
+		pfx_addr[prefix_addrlen - 1] &= 0xff << (8 - (prefixlen % 8));
+	*key = nexthop_fanout_xxh32(pfx_addr, prefix_addrlen, *key);
+
+	return true;
+}
+
+/*
+ * This match is specifically intended for EVPN type-5 prefixes.
+ *
+ * Example usage:
+ *
+ * ip community-list standard T2-GROUP permit 65000:123
+ *
+ * route-map FANOUT permit 10
+ *  match community T2-GROUP
+ *  match nexthop-fanout 20 36
+ *  set metric 0
+ * route-map FANOUT permit 20
+ *  match community T2-GROUP
+ *  set metric 100
+ * route-map FANOUT permit 30
+ *
+ * Internal errors fail open, so the first sequence matches and sets MED 0.
+ * The hash input is peer IP, VTEP IP, and the IPv4/IPv6 prefix carried
+ * by the EVPN type-5 route.
+ */
+static enum route_map_cmd_result_t
+route_match_nexthop_fanout(void *rule, const struct prefix *prefix,
+				   void *object)
+{
+	struct nexthop_fanout_match *fanout = rule;
+	struct bgp_path_info *path = object;
+	const uint8_t *peer_addr;
+	size_t peer_addrlen;
+	const void *nexthop;
+	size_t nexthop_len;
+	uint32_t key;
+
+	if (!fanout || fanout->total_t2s == 0)
+		return RMAP_MATCH;
+
+	if (!path || !path->peer || !path->peer->connection || !path->attr)
+		return RMAP_MATCH;
+
+	peer_addr = sockunion_get_addr(&path->peer->connection->su);
+	peer_addrlen = sockunion_get_addrlen(&path->peer->connection->su);
+	if (!peer_addr || !peer_addrlen ||
+	    nexthop_fanout_addr_is_zero(peer_addr, peer_addrlen))
+		return RMAP_MATCH;
+
+	switch (path->attr->mp_nexthop_len) {
+	case BGP_ATTR_NHLEN_IPV4:
+	case BGP_ATTR_NHLEN_VPNV4:
+		nexthop = &path->attr->mp_nexthop_global_in;
+		nexthop_len = IPV4_MAX_BYTELEN;
+		break;
+	case BGP_ATTR_NHLEN_IPV6_GLOBAL:
+	case BGP_ATTR_NHLEN_IPV6_GLOBAL_AND_LL:
+	case BGP_ATTR_NHLEN_VPNV6_GLOBAL:
+	case BGP_ATTR_NHLEN_VPNV6_GLOBAL_AND_LL:
+		nexthop = &path->attr->mp_nexthop_global;
+		nexthop_len = IPV6_MAX_BYTELEN;
+		break;
+	default:
+		return RMAP_MATCH;
+	}
+	if (nexthop_fanout_addr_is_zero(nexthop, nexthop_len))
+		return RMAP_MATCH;
+
+	key = nexthop_fanout_xxh32(peer_addr, peer_addrlen, 0);
+	key = nexthop_fanout_xxh32(nexthop, nexthop_len, key);
+	if (!nexthop_fanout_hash_prefix(prefix, &key))
+		return RMAP_MATCH;
+
+	return key % fanout->total_t2s < fanout->threshold ? RMAP_MATCH
+						       : RMAP_NOMATCH;
+}
+
+static void *route_match_nexthop_fanout_compile(const char *arg)
+{
+	struct nexthop_fanout_match *fanout;
+	char *endptr;
+	unsigned long threshold;
+	unsigned long total_t2s;
+
+	if (!arg)
+		return NULL;
+
+	errno = 0;
+	threshold = strtoul(arg, &endptr, 10);
+	if (endptr == arg || errno || threshold > UINT32_MAX)
+		return NULL;
+
+	if (!isspace((unsigned char)*endptr))
+		return NULL;
+	while (isspace((unsigned char)*endptr))
+		endptr++;
+
+	errno = 0;
+	total_t2s = strtoul(endptr, &endptr, 10);
+	while (isspace((unsigned char)*endptr))
+		endptr++;
+	if (errno || *endptr != '\0' || total_t2s == 0 ||
+	    total_t2s > UINT32_MAX || threshold > total_t2s)
+		return NULL;
+
+	fanout = XMALLOC(MTYPE_ROUTE_MAP_COMPILED,
+			 sizeof(struct nexthop_fanout_match));
+	fanout->threshold = threshold;
+	fanout->total_t2s = total_t2s;
+
+	return fanout;
+}
+
+static void route_match_nexthop_fanout_free(void *rule)
+{
+	XFREE(MTYPE_ROUTE_MAP_COMPILED, rule);
+}
+
+static const struct route_map_rule_cmd route_match_nexthop_fanout_cmd = {
+	"nexthop-fanout",
+	route_match_nexthop_fanout,
+	route_match_nexthop_fanout_compile,
+	route_match_nexthop_fanout_free
 };
 
 /* `match interface IFNAME' */
@@ -5756,6 +6053,66 @@ DEFUN_YANG (no_match_probability,
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+/* match nexthop-fanout */
+DEFUN_YANG (match_nexthop_fanout,
+	    match_nexthop_fanout_cmd,
+	    "match nexthop-fanout (0-4294967295) (1-4294967295)",
+	    MATCH_STR
+	    "Match deterministic percentage of peer/nexthop pairs\n"
+	    "Bucket threshold\n"
+	    "Total T2 count\n")
+{
+	int idx_threshold = 2;
+	int idx_total_t2s = 3;
+	const char *xpath =
+		"./match-condition[condition='frr-bgp-route-map:nexthop-fanout']";
+	char xpath_value[XPATH_MAXLEN];
+	char fanout_value[64];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+	snprintf(fanout_value, sizeof(fanout_value), "%s %s",
+		 argv[idx_threshold]->arg, argv[idx_total_t2s]->arg);
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-match-condition/frr-bgp-route-map:nexthop-fanout",
+		 xpath);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY,
+			      fanout_value);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+DEFUN_YANG (no_match_nexthop_fanout,
+	    no_match_nexthop_fanout_cmd,
+	    "no match nexthop-fanout [(0-4294967295) (1-4294967295)]",
+	    NO_STR
+	    MATCH_STR
+	    "Match deterministic percentage of peer/nexthop pairs\n"
+	    "Bucket threshold\n"
+	    "Total T2 count\n")
+{
+	int idx_threshold = 3;
+	int idx_total_t2s = 4;
+	const char *xpath =
+		"./match-condition[condition='frr-bgp-route-map:nexthop-fanout']";
+	char xpath_value[XPATH_MAXLEN];
+	char fanout_value[64];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+
+	if (argc <= idx_threshold)
+		return nb_cli_apply_changes(vty, NULL);
+
+	snprintf(fanout_value, sizeof(fanout_value), "%s %s",
+		 argv[idx_threshold]->arg, argv[idx_total_t2s]->arg);
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-match-condition/frr-bgp-route-map:nexthop-fanout",
+		 xpath);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_DESTROY,
+			      fanout_value);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 
 DEFPY_YANG (match_ip_route_source,
        match_ip_route_source_cmd,
@@ -8290,6 +8647,7 @@ void bgp_route_map_init(void)
 	route_map_install_match(&route_match_metric_cmd);
 	route_map_install_match(&route_match_origin_cmd);
 	route_map_install_match(&route_match_probability_cmd);
+	route_map_install_match(&route_match_nexthop_fanout_cmd);
 	route_map_install_match(&route_match_interface_cmd);
 	route_map_install_match(&route_match_tag_cmd);
 	route_map_install_match(&route_match_mac_address_cmd);
@@ -8381,6 +8739,8 @@ void bgp_route_map_init(void)
 	install_element(RMAP_NODE, &no_match_origin_cmd);
 	install_element(RMAP_NODE, &match_probability_cmd);
 	install_element(RMAP_NODE, &no_match_probability_cmd);
+	install_element(RMAP_NODE, &match_nexthop_fanout_cmd);
+	install_element(RMAP_NODE, &no_match_nexthop_fanout_cmd);
 
 	install_element(RMAP_NODE, &no_set_table_id_cmd);
 	install_element(RMAP_NODE, &set_table_id_cmd);

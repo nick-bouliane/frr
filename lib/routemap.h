@@ -289,6 +289,8 @@ DECLARE_QOBJ_TYPE(route_map);
 	(strmatch(C, "frr-bgp-route-map:rpki-extcommunity"))
 #define IS_MATCH_PROBABILITY(C)                                                \
 	(strmatch(C, "frr-bgp-route-map:probability"))
+#define IS_MATCH_NEXTHOP_FANOUT(C)                                             \
+	(strmatch(C, "frr-bgp-route-map:nexthop-fanout"))
 #define IS_MATCH_SRC_VRF(C)                                                    \
 	(strmatch(C, "frr-bgp-route-map:source-vrf"))
 #define IS_MATCH_PEER(C) (strmatch(C, "frr-bgp-route-map:peer"))

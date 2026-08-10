@@ -736,6 +736,11 @@ void route_map_condition_show(struct vty *vty, const struct lyd_node *dnode,
 			yang_dnode_get_string(
 				dnode,
 				"./rmap-match-condition/frr-bgp-route-map:probability"));
+	} else if (IS_MATCH_NEXTHOP_FANOUT(condition)) {
+		vty_out(vty, " match nexthop-fanout %s\n",
+			yang_dnode_get_string(
+				dnode,
+				"./rmap-match-condition/frr-bgp-route-map:nexthop-fanout"));
 	} else if (IS_MATCH_SRC_VRF(condition)) {
 		vty_out(vty, " match source-vrf %s\n",
 			yang_dnode_get_string(
