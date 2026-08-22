@@ -1363,6 +1363,9 @@ AC_CHECK_FUNCS([ \
 	posix_fallocate \
 	sendmmsg \
 	explicit_bzero \
+	fopencookie \
+	funopen \
+	setproctitle \
 	])
 
 dnl note the trailing _ in the following macros; this is neccessary since

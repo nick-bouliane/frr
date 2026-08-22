@@ -6,7 +6,6 @@
  */
 
 #include <zebra.h>
-#include <sys/wait.h>
 #include "command.h"
 #include "frrevent.h"
 #include "network.h"
@@ -1542,83 +1541,42 @@ static int bgp_show_ethernet_vpn(struct vty *vty, struct prefix_rd *prd, enum bg
 	return CMD_SUCCESS;
 }
 
-static void bgp_show_evpn_fork_reap(struct event *event)
+struct bgp_show_ethernet_vpn_args {
+	struct prefix_rd *prd;
+	enum bgp_show_type type;
+	void *output_arg;
+	int option;
+	bool use_json;
+	bool brief;
+};
+
+static int bgp_show_fork_run_ethernet_vpn(struct vty *vty, void *arg)
 {
-	pid_t pid = (pid_t)(uintptr_t)EVENT_ARG(event);
-	int status;
-	pid_t ret;
+	struct bgp_show_ethernet_vpn_args *show = arg;
 
-	do {
-		ret = waitpid(pid, &status, WNOHANG);
-	} while (ret < 0 && errno == EINTR);
-
-	if (ret == 0)
-		event_add_timer_msec(bm->master, bgp_show_evpn_fork_reap,
-				     (void *)(uintptr_t)pid, 100, NULL);
+	return bgp_show_ethernet_vpn(vty, show->prd, show->type,
+				     show->output_arg, show->option,
+				     show->use_json, show->brief);
 }
 
+/* Run bgp_show_ethernet_vpn() in a forked show worker (see the "Forked
+ * show workers" comment in bgp_route.c); walking the full EVPN table can
+ * hold the event loop for a long time on a loaded route reflector.
+ */
 static int bgp_show_ethernet_vpn_forked(struct vty *vty, struct prefix_rd *prd,
 					enum bgp_show_type type, void *output_arg,
 					int option, bool use_json, bool brief)
 {
-	int pipefd[2];
-	pid_t pid;
+	struct bgp_show_ethernet_vpn_args args = {
+		.prd = prd,
+		.type = type,
+		.output_arg = output_arg,
+		.option = option,
+		.use_json = use_json,
+		.brief = brief,
+	};
 
-	/* Only vtysh can receive a passed fd. Filters need the parent vty buffer. */
-	if (vty->type != VTY_SHELL_SERV || vty->filter)
-		return bgp_show_ethernet_vpn(vty, prd, type, output_arg, option,
-					     use_json, brief);
-
-	if (pipe(pipefd) < 0) {
-		vty_out(vty, "%% Failed to create show output pipe: %m\n");
-		return CMD_WARNING;
-	}
-
-	set_cloexec(pipefd[0]);
-	set_cloexec(pipefd[1]);
-
-	pid = fork();
-	if (pid < 0) {
-		close(pipefd[0]);
-		close(pipefd[1]);
-		vty_out(vty, "%% Failed to fork show worker: %m\n");
-		return CMD_WARNING;
-	}
-
-	if (pid == 0) {
-		FILE *out;
-		struct vty child_vty = *vty;
-		int ret;
-
-		close(pipefd[0]);
-		out = fdopen(pipefd[1], "w");
-		if (!out)
-			_exit(1);
-
-		/* Reuse the existing renderer unchanged, but redirect vty_out() to the pipe. */
-		child_vty.type = VTY_SHELL;
-		child_vty.of = out;
-		child_vty.of_saved = NULL;
-		child_vty.status = VTY_NORMAL;
-		child_vty.pass_fd = -1;
-		/* The forked worker is synchronous; it must not reuse parent events. */
-		child_vty.frame_pos = 0;
-		child_vty.t_read = NULL;
-		child_vty.t_write = NULL;
-		child_vty.t_timeout = NULL;
-
-		ret = bgp_show_ethernet_vpn(&child_vty, prd, type, output_arg,
-						option, use_json, brief);
-		fflush(out);
-		fclose(out);
-		_exit(ret == CMD_SUCCESS ? 0 : 1);
-	}
-
-	close(pipefd[1]);
-	vty_pass_fd(vty, pipefd[0]);
-	event_add_timer_msec(bm->master, bgp_show_evpn_fork_reap,
-			     (void *)(uintptr_t)pid, 100, NULL);
-	return CMD_SUCCESS;
+	return bgp_show_fork_run(vty, bgp_show_fork_run_ethernet_vpn, &args);
 }
 
 DEFUN(show_ip_bgp_l2vpn_evpn,

@@ -7,6 +7,12 @@
 #include <zebra.h>
 #include <math.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <dirent.h>
+#ifdef GNU_LINUX
+#include <sys/prctl.h>
+#endif
 
 #include "bgpd/bgp_addpath_types.h"
 #include "printfrr.h"
@@ -15532,6 +15538,82 @@ static int bgp_show(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 			      &json_header_depth, show_flags, rpki_target_state, brief);
 }
 
+/*
+ * Forked show workers
+ * -------------------
+ *
+ * Expensive show commands issued over vtysh are executed in a short-lived
+ * forked child (a "show worker") so that walking and rendering a large RIB
+ * does not monopolize the bgpd event loop.  The parent passes the read side
+ * of a pipe to vtysh and immediately returns to the event loop; the worker
+ * renders the command into the write side and exits.
+ *
+ * fork() gives the worker a full copy of the daemon: its memory (which is
+ * exactly what makes reusing the renderers possible), but also its sockets,
+ * signal handlers and process name.  Everything except the memory snapshot
+ * is a liability, because a worker can outlive its parent (bgpd crashes
+ * with a worker in flight) or outlive its usefulness (vtysh stops draining
+ * the pipe).  bgp_show_worker_begin() therefore strips the child down to
+ * the bare renderer:
+ *
+ *  - Every inherited descriptor except the output pipe is closed.  A
+ *    lingering worker must not hold the port-179 listener open (it would
+ *    fool TCP-probe health checks and prevent a restarted bgpd from
+ *    binding), and peer/zebra TCP sessions must be reset promptly if the
+ *    parent dies while a worker is still running.
+ *
+ *  - Signal dispositions and the signal mask are reset to defaults, with
+ *    one exception: SIGPIPE stays ignored.  If vtysh goes away, writes must
+ *    fail with EPIPE so stdio latches the stream error and the render loop
+ *    finishes on its own, instead of the worker being killed mid-write.
+ *
+ *  - The process name (comm) is set to "bgpd-show" so pgrep/top-style
+ *    liveness checks do not mistake an orphaned worker for the daemon.
+ *
+ *  - A stall watchdog is armed.  A legitimate command has no useful upper
+ *    bound on total runtime (a full-table JSON dump on a large route
+ *    reflector takes minutes), so we bound *inactivity* instead: every
+ *    successful write to the pipe re-arms alarm(BGP_SHOW_WORKER_STALL_SECS)
+ *    and SIGALRM is left at SIG_DFL.  A worker that makes no progress for
+ *    that long -- vtysh stopped draining the pipe, or the walk wedged on
+ *    state that fork() copied mid-update -- is terminated by the kernel
+ *    with no cooperation needed from the wedged code itself.  The renewal
+ *    needs a stdio write hook: fopencookie(3) on glibc/musl, funopen(3)
+ *    on the BSDs.  Platforms with neither get no watchdog at all rather
+ *    than a fixed cap that would kill legitimately slow commands.
+ *
+ * The parent reaps workers asynchronously (bgp_show_fork_reap) and caps
+ * concurrency at BGP_SHOW_WORKER_MAX.  At the cap, new forkable commands
+ * are refused with an error: running them inline would block the event
+ * loop (the very thing this mechanism exists to avoid), and queueing would
+ * silently hang the vtysh caller, which waits synchronously.
+ *
+ * Rules for code running inside a worker: render to the vty and nothing
+ * else.  Do not log (zlog state was snapshotted mid-flight and its
+ * descriptors are closed), do not schedule events, do not touch sockets.
+ * The worker must never return into the daemon code path; it ends in
+ * _exit() so atexit()/cleanup handlers of the parent never run.
+ */
+
+/* Upper bound on concurrently running show workers.  Each worker holds a
+ * full COW snapshot of bgpd's address space; a handful is plenty for
+ * interactive use and keeps worst-case memory duplication bounded.
+ */
+#define BGP_SHOW_WORKER_MAX 4
+
+/* Seconds a worker may go without writing a single byte into its output
+ * pipe before the stall watchdog (SIGALRM at SIG_DFL) terminates it.
+ * Generous on purpose: it only needs to catch workers that are stuck, not
+ * ones that are slow.
+ */
+#define BGP_SHOW_WORKER_STALL_SECS 300
+
+/* Number of workers currently forked and not yet reaped.  Incremented on
+ * fork in bgp_show_fork_run(), decremented in bgp_show_fork_reap() once
+ * waitpid() collects the child.
+ */
+static unsigned int bgp_show_workers_active;
+
 static void bgp_show_fork_reap(struct event *event)
 {
 	pid_t pid = (pid_t)(uintptr_t)EVENT_ARG(event);
@@ -15544,9 +15626,181 @@ static void bgp_show_fork_reap(struct event *event)
 	} while (ret < 0 && errno == EINTR);
 
 	/* The show worker may still be writing to vtysh. Poll without blocking bgpd. */
-	if (ret == 0)
+	if (ret == 0) {
 		event_add_timer_msec(bm->master, bgp_show_fork_reap,
 				     (void *)(uintptr_t)pid, 100, NULL);
+		return;
+	}
+
+	/* Collected (or already gone): release the concurrency slot. */
+	assert(bgp_show_workers_active > 0);
+	bgp_show_workers_active--;
+}
+
+/* Close every descriptor the worker inherited from bgpd except @keep_fd
+ * and stdio.  This releases the child's duplicates of the listening,
+ * peer and zebra sockets (see the "Forked show workers" comment above).
+ */
+static void bgp_show_worker_close_fds(int keep_fd)
+{
+	struct rlimit nofile;
+	struct dirent *de;
+	rlim_t maxfd = 1024;
+	rlim_t fd;
+	DIR *dir;
+
+	dir = opendir("/proc/self/fd");
+	if (dir) {
+		int dir_fd = dirfd(dir);
+
+		while ((de = readdir(dir)) != NULL) {
+			char *end = NULL;
+			long n = strtol(de->d_name, &end, 10);
+
+			if (end == de->d_name || *end != '\0')
+				continue;
+			if (n <= STDERR_FILENO || n == keep_fd || n == dir_fd)
+				continue;
+			close((int)n);
+		}
+		closedir(dir);
+		return;
+	}
+
+	/* No /proc (or it failed to open): fall back to brute force up to
+	 * the descriptor limit.
+	 */
+	if (getrlimit(RLIMIT_NOFILE, &nofile) == 0 &&
+	    nofile.rlim_cur != RLIM_INFINITY)
+		maxfd = nofile.rlim_cur;
+
+	for (fd = STDERR_FILENO + 1; fd < maxfd; fd++)
+		if ((int)fd != keep_fd)
+			close((int)fd);
+}
+
+/* Return the worker to default signal handling.  bgpd's handlers assume
+ * the daemon's event loop and must not run in the child; in particular
+ * SIGALRM must be at SIG_DFL for the stall watchdog to be lethal.
+ * SIGPIPE alone keeps the daemon's SIG_IGN disposition so that a vanished
+ * vtysh surfaces as EPIPE on write() rather than killing the worker.
+ */
+static void bgp_show_worker_reset_signals(void)
+{
+	static const int sigs[] = { SIGHUP,  SIGINT,  SIGTERM, SIGUSR1,
+				    SIGUSR2, SIGALRM, SIGCHLD };
+	struct sigaction act;
+	sigset_t mask;
+	unsigned int i;
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = SIG_DFL;
+
+	for (i = 0; i < array_size(sigs); i++)
+		sigaction(sigs[i], &act, NULL);
+
+	sigemptyset(&mask);
+	sigprocmask(SIG_SETMASK, &mask, NULL);
+}
+
+#if defined(HAVE_FOPENCOOKIE) || defined(HAVE_FUNOPEN)
+/* stdio write hook for the worker's output pipe.  Each byte accepted by
+ * the pipe is proof of forward progress, so each successful write pushes
+ * the stall deadline out again; a worker that stops producing (or whose
+ * consumer stops draining) runs out the alarm and is terminated.
+ *
+ * Per fopencookie(3) a short return signals an error to stdio, which
+ * latches the stream's error flag; every later vty_out() on the stream
+ * then fails immediately without touching the pipe, letting the render
+ * loop finish fast against a dead consumer.
+ */
+static ssize_t bgp_show_worker_write(void *cookie, const char *buf,
+				     size_t len)
+{
+	int fd = (int)(intptr_t)cookie;
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t nwritten = write(fd, buf + off, len - off);
+
+		if (nwritten < 0) {
+			if (errno == EINTR)
+				continue;
+			/* EPIPE (vtysh went away) or a hard error: stop
+			 * renewing the watchdog and report the error up.
+			 */
+			return 0;
+		}
+		off += (size_t)nwritten;
+		alarm(BGP_SHOW_WORKER_STALL_SECS);
+	}
+
+	return (ssize_t)len;
+}
+#endif /* HAVE_FOPENCOOKIE || HAVE_FUNOPEN */
+
+#if !defined(HAVE_FOPENCOOKIE) && defined(HAVE_FUNOPEN)
+/* funopen(3) adapter for the BSDs: their writefn takes/returns int and
+ * reports errors as -1 rather than fopencookie's short count.
+ */
+static int bgp_show_worker_write_funopen(void *cookie, const char *buf,
+					 int len)
+{
+	if (bgp_show_worker_write(cookie, buf, (size_t)len) != (ssize_t)len)
+		return -1;
+	return len;
+}
+#endif /* !HAVE_FOPENCOOKIE && HAVE_FUNOPEN */
+
+/* Establish the worker runtime in a freshly forked child and return the
+ * stdio stream the renderer writes into, or NULL on failure.  Must be
+ * called immediately after fork(), before any daemon state is touched.
+ */
+static FILE *bgp_show_worker_begin(int fd)
+{
+	FILE *out;
+#ifdef HAVE_FOPENCOOKIE
+	cookie_io_functions_t io = { .write = bgp_show_worker_write };
+#endif
+
+	bgp_show_worker_close_fds(fd);
+	bgp_show_worker_reset_signals();
+
+	/* Rename so process-scanning health checks cannot mistake an
+	 * orphaned worker for the daemon itself.  Linux and the BSDs
+	 * rename different things: PR_SET_NAME changes the comm name that
+	 * a bare pgrep and top match (but not the ps argv line), while
+	 * setproctitle(3) changes the ps/top title (but not the accounting
+	 * name pgrep matches).  Each covers the check style native to its
+	 * platform.
+	 */
+#ifdef GNU_LINUX
+	prctl(PR_SET_NAME, "bgpd-show", 0, 0, 0);
+#elif defined(HAVE_SETPROCTITLE)
+	setproctitle("show worker");
+#endif
+
+	/* Route stdio through the renew-on-progress write hook. */
+#if defined(HAVE_FOPENCOOKIE)
+	out = fopencookie((void *)(intptr_t)fd, "w", io);
+#elif defined(HAVE_FUNOPEN)
+	out = funopen((void *)(intptr_t)fd, NULL,
+		      bgp_show_worker_write_funopen, NULL, NULL);
+#else
+	/* No way to hook writes on this platform: plain stdio and no stall
+	 * watchdog.  A fixed alarm here would cap total runtime instead of
+	 * inactivity and kill legitimately slow commands, which is worse
+	 * than a worker lingering until vtysh drains or exits.
+	 */
+	return fdopen(fd, "w");
+#endif
+
+	/* Arm the stall watchdog; also covers a worker that wedges before
+	 * its very first write.
+	 */
+	alarm(BGP_SHOW_WORKER_STALL_SECS);
+
+	return out;
 }
 
 /* typedef in bgp_route.h */
@@ -15714,6 +15968,17 @@ int bgp_show_fork_run(struct vty *vty, bgp_show_fork_func_t func, void *arg)
 	if (vty->type != VTY_SHELL_SERV || vty->filter)
 		return func(vty, arg);
 
+	/* Refuse rather than degrade at the cap: running inline would block
+	 * the event loop (the reason this mechanism exists), and queueing
+	 * would silently hang the synchronous vtysh caller.
+	 */
+	if (bgp_show_workers_active >= BGP_SHOW_WORKER_MAX) {
+		vty_out(vty,
+			"%% Too many BGP show workers already running (%u), try again later\n",
+			bgp_show_workers_active);
+		return CMD_WARNING;
+	}
+
 	if (pipe(pipefd) < 0) {
 		vty_out(vty, "%% Failed to create show output pipe: %m\n");
 		return CMD_WARNING;
@@ -15736,7 +16001,11 @@ int bgp_show_fork_run(struct vty *vty, bgp_show_fork_func_t func, void *arg)
 		int ret;
 
 		close(pipefd[0]);
-		out = fdopen(pipefd[1], "w");
+		/* Strip the daemon copy down to a pure renderer: close
+		 * inherited sockets, reset signals, rename, arm the stall
+		 * watchdog.  See "Forked show workers" above.
+		 */
+		out = bgp_show_worker_begin(pipefd[1]);
 		if (!out)
 			_exit(1);
 
@@ -15759,6 +16028,7 @@ int bgp_show_fork_run(struct vty *vty, bgp_show_fork_func_t func, void *arg)
 	}
 
 	close(pipefd[1]);
+	bgp_show_workers_active++;
 	/* vtysh drains the read side directly, keeping bgpd out of the output path. */
 	vty_pass_fd(vty, pipefd[0]);
 	/* The child exits independently after output is drained; clean it up later. */
