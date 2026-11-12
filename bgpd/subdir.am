@@ -67,6 +67,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_rd.c \
 	bgpd/bgp_regex.c \
 	bgpd/bgp_route.c \
+	bgpd/bgp_rt_tracker.c \
 	bgpd/bgp_routemap.c \
 	bgpd/bgp_routemap_nb.c \
 	bgpd/bgp_routemap_nb_config.c \
@@ -157,6 +158,7 @@ noinst_HEADERS += \
 	bgpd/bgp_regex.h \
 	bgpd/bgp_rpki.h \
 	bgpd/bgp_route.h \
+	bgpd/bgp_rt_tracker.h \
 	bgpd/bgp_routemap_nb.h \
 	bgpd/bgp_script.h \
 	bgpd/bgp_snmp.h \
@@ -223,6 +225,7 @@ clippy_scan += \
 	bgpd/bgp_evpn_vty.c \
 	bgpd/bgp_labelpool.c \
 	bgpd/bgp_route.c \
+	bgpd/bgp_rt_tracker.c \
 	bgpd/bgp_routemap.c \
 	bgpd/bgp_rpki.c \
 	bgpd/bgp_vty.c \
