@@ -53,6 +53,7 @@
 #include "bgpd/bgp_nexthop.h"
 #include "bgpd/bgp_damp.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_peer_rt_policy.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #include "bgpd/rfapi/rfapi_backend.h"
@@ -9473,6 +9474,7 @@ void bgp_init(unsigned short instance)
 	bgp_route_map_init();
 	bgp_scan_vty_init();
 	bgp_mplsvpn_init();
+	bgp_peer_rt_policy_init();
 #ifdef ENABLE_BGP_VNC
 	rfapi_init();
 #endif
