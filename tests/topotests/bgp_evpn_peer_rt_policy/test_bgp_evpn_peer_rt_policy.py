@@ -46,15 +46,27 @@ def setup_module(mod):
     tgen.start_topology()
 
     # vxlan + bridge for EVPN on r1
-    tgen.net["r1"].cmd(
+    tgen.net["r1"].cmd_raises(
         """
+ip link add vrf-50 type vrf table 50
+ip link set dev vrf-50 up
+ip link add vrf-1001 type vrf table 1001
+ip link set dev vrf-1001 up
+ip link add loop50 type dummy
+ip link set dev loop50 master vrf-50
+ip link set dev loop50 up
+ip link add loop1001 type dummy
+ip link set dev loop1001 master vrf-1001
+ip link set dev loop1001 up
 ip link add vxlan50 type vxlan id 50 dstport 4789 local 10.10.10.1 nolearning
 ip link add name br50 type bridge
+ip link set dev br50 master vrf-50
 ip link set dev vxlan50 master br50
 ip link set up dev br50
 ip link set up dev vxlan50
 ip link add vxlan1001 type vxlan id 1001 dstport 4789 local 10.10.10.1 nolearning
 ip link add name br1001 type bridge
+ip link set dev br1001 master vrf-1001
 ip link set dev vxlan1001 master br1001
 ip link set up dev br1001
 ip link set up dev vxlan1001
@@ -62,15 +74,27 @@ ip link set up dev vxlan1001
     )
 
     # vxlan + bridge for EVPN on r2
-    tgen.net["r2"].cmd(
+    tgen.net["r2"].cmd_raises(
         """
+ip link add vrf-50 type vrf table 50
+ip link set dev vrf-50 up
+ip link add vrf-1001 type vrf table 1001
+ip link set dev vrf-1001 up
+ip link add loop50 type dummy
+ip link set dev loop50 master vrf-50
+ip link set dev loop50 up
+ip link add loop1001 type dummy
+ip link set dev loop1001 master vrf-1001
+ip link set dev loop1001 up
 ip link add vxlan50 type vxlan id 50 dstport 4789 local 10.10.10.2 nolearning
 ip link add name br50 type bridge
+ip link set dev br50 master vrf-50
 ip link set dev vxlan50 master br50
 ip link set up dev br50
 ip link set up dev vxlan50
 ip link add vxlan1001 type vxlan id 1001 dstport 4789 local 10.10.10.2 nolearning
 ip link add name br1001 type bridge
+ip link set dev br1001 master vrf-1001
 ip link set dev vxlan1001 master br1001
 ip link set up dev br1001
 ip link set up dev vxlan1001
@@ -100,6 +124,12 @@ def test_initial_policy_allows_rt50_only():
         pytest.skip(tgen.errors)
 
     r1 = tgen.gears["r1"]
+
+    policy_output = r1.vtysh_cmd("show peer-rt-policy ALLOWED")
+    assert "peer 192.168.1.2 permit rt 50" in policy_output
+
+    route_map_output = r1.vtysh_cmd("show route-map PRP-IN")
+    assert "peer-rt-policy ALLOWED" in route_map_output
 
     def _check_rt50_accepted():
         output = json.loads(

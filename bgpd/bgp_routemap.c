@@ -5561,6 +5561,55 @@ DEFPY_YANG(no_match_vrl_source_vrf,
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+DEFPY_YANG(match_peer_rt_policy,
+	   match_peer_rt_policy_cmd,
+	   "match peer-rt-policy WORD$policy [reset-on-violation$reset]",
+	   MATCH_STR
+	   "Match against a per-peer route-target allow-list\n"
+	   "Policy name\n"
+	   "Reset the peer when a route carries an unauthorized route target\n")
+{
+	const char *xpath =
+		"./match-condition[condition='frr-bgp-route-map:peer-rt-policy']";
+	char xpath_value[XPATH_MAXLEN];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-match-condition/frr-bgp-route-map:peer-rt-policy", xpath);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_CREATE, NULL);
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-match-condition/frr-bgp-route-map:peer-rt-policy/policy-name",
+		 xpath);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY, policy);
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-match-condition/frr-bgp-route-map:peer-rt-policy/reset-on-violation",
+		 xpath);
+	if (reset)
+		nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY, "true");
+	else
+		nb_cli_enqueue_change(vty, xpath_value, NB_OP_DESTROY, NULL);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+DEFPY_YANG(no_match_peer_rt_policy,
+	   no_match_peer_rt_policy_cmd,
+	   "no match peer-rt-policy [WORD$policy [reset-on-violation$reset]]",
+	   NO_STR
+	   MATCH_STR
+	   "Match against a per-peer route-target allow-list\n"
+	   "Policy name\n"
+	   "Reset the peer when a route carries an unauthorized route target\n")
+{
+	const char *xpath =
+		"./match-condition[condition='frr-bgp-route-map:peer-rt-policy']";
+
+	(void)policy;
+	(void)reset;
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 DEFPY_YANG (match_peer,
        match_peer_cmd,
        "match peer <A.B.C.D$addrv4|X:X::X:X$addrv6|WORD$intf>",
@@ -8378,6 +8427,8 @@ void bgp_route_map_init(void)
 	install_element(RMAP_NODE, &no_set_evpn_gw_ip_ipv6_cmd);
 	install_element(RMAP_NODE, &match_vrl_source_vrf_cmd);
 	install_element(RMAP_NODE, &no_match_vrl_source_vrf_cmd);
+	install_element(RMAP_NODE, &match_peer_rt_policy_cmd);
+	install_element(RMAP_NODE, &no_match_peer_rt_policy_cmd);
 
 	install_element(RMAP_NODE, &match_aspath_cmd);
 	install_element(RMAP_NODE, &no_match_aspath_cmd);

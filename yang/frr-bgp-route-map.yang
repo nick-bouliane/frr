@@ -91,6 +91,12 @@ module frr-bgp-route-map {
       "Match source vrf of routes";
   }
 
+  identity peer-rt-policy {
+    base frr-route-map:rmap-match-type;
+    description
+      "Match routes against a per-peer route-target allow-list";
+  }
+
   identity peer {
     base frr-route-map:rmap-match-type;
     description
@@ -723,6 +729,26 @@ identity set-extcommunity-color {
         type string;
         description
           "Specifies the source VRF for the route";
+      }
+    }
+
+    case peer-rt-policy {
+      when "derived-from-or-self(../frr-route-map:condition, 'frr-bgp-route-map:peer-rt-policy')";
+      container peer-rt-policy {
+        description
+          "Per-peer route-target allow-list matcher";
+        leaf policy-name {
+          type string;
+          mandatory true;
+          description
+            "Name of the per-peer route-target allow-list policy";
+        }
+        leaf reset-on-violation {
+          type boolean;
+          default false;
+          description
+            "Reset the peer when a route carries an unauthorized route target";
+        }
       }
     }
 

@@ -81,6 +81,27 @@ const struct frr_yang_module_info frr_bgp_route_map_info = {
 				.destroy = lib_route_map_entry_match_condition_rmap_match_condition_source_vrf_destroy,
 			}
 		},
+		{
+			.xpath = "/frr-route-map:lib/route-map/entry/match-condition/rmap-match-condition/frr-bgp-route-map:peer-rt-policy",
+			.cbs = {
+				.create = lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_create,
+				.destroy = lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_destroy,
+				.apply_finish = lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_finish,
+			}
+		},
+		{
+			.xpath = "/frr-route-map:lib/route-map/entry/match-condition/rmap-match-condition/frr-bgp-route-map:peer-rt-policy/policy-name",
+			.cbs = {
+				.modify = lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_policy_name_modify,
+			}
+		},
+		{
+			.xpath = "/frr-route-map:lib/route-map/entry/match-condition/rmap-match-condition/frr-bgp-route-map:peer-rt-policy/reset-on-violation",
+			.cbs = {
+				.modify = lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_reset_on_violation_modify,
+				.destroy = lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_reset_on_violation_destroy,
+			}
+		},
 	    {
 			.xpath = "/frr-route-map:lib/route-map/entry/match-condition/rmap-match-condition/frr-bgp-route-map:source-protocol",
 			.cbs = {

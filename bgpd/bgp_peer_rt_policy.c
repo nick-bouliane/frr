@@ -505,7 +505,7 @@ DEFPY(show_peer_rt_policy,
 		if (name && strcmp(pol->name, name) != 0)
 			continue;
 
-		vty_out(vty, "peer-rt-policy %s (%u peers)\n",
+		vty_out(vty, "peer-rt-policy %s (%lu peers)\n",
 			pol->name, pol->peer_hash->count);
 		hash_iterate(pol->peer_hash, prp_show_peer_iter, &ctx);
 	}
@@ -629,56 +629,6 @@ static const struct route_map_rule_cmd route_match_peer_rt_policy_cmd_rule = {
 	route_match_peer_rt_policy_free
 };
 
-DEFUN(match_peer_rt_policy,
-      match_peer_rt_policy_cmd,
-      "match peer-rt-policy WORD [reset-on-violation]",
-      MATCH_STR
-      "Match against per-peer RT allow-list\n"
-      "Policy name\n"
-      "Reset peer on unauthorized RT (use for inbound only)\n")
-{
-	VTY_DECLVAR_CONTEXT(route_map_index, index);
-	const char *name = argv[2]->arg;
-	char rule_arg[300];
-
-	if (argc > 3)
-		snprintf(rule_arg, sizeof(rule_arg), "%s reset-on-violation",
-			 name);
-	else
-		snprintf(rule_arg, sizeof(rule_arg), "%s", name);
-
-	return route_map_add_match(index, "peer-rt-policy", rule_arg,
-				   RMAP_EVENT_MATCH_ADDED);
-}
-
-DEFUN(no_match_peer_rt_policy,
-      no_match_peer_rt_policy_cmd,
-      "no match peer-rt-policy [WORD [reset-on-violation]]",
-      NO_STR
-      MATCH_STR
-      "Match against per-peer RT allow-list\n"
-      "Policy name\n"
-      "Reset peer on unauthorized RT\n")
-{
-	VTY_DECLVAR_CONTEXT(route_map_index, index);
-	const char *name = (argc > 3) ? argv[3]->arg : NULL;
-	char rule_arg[300];
-
-	if (name) {
-		if (argc > 4)
-			snprintf(rule_arg, sizeof(rule_arg),
-				 "%s reset-on-violation", name);
-		else
-			snprintf(rule_arg, sizeof(rule_arg), "%s", name);
-		return route_map_delete_match(index, "peer-rt-policy",
-					      rule_arg,
-					      RMAP_EVENT_MATCH_DELETED);
-	}
-
-	return route_map_delete_match(index, "peer-rt-policy", NULL,
-				      RMAP_EVENT_MATCH_DELETED);
-}
-
 /* ===================================================================
  * Config write — persist policies on "write mem"
  * =================================================================== */
@@ -739,8 +689,6 @@ void bgp_peer_rt_policy_init(void)
 	install_element(VIEW_NODE, &show_peer_rt_policy_cmd);
 
 	route_map_install_match(&route_match_peer_rt_policy_cmd_rule);
-	install_element(RMAP_NODE, &match_peer_rt_policy_cmd);
-	install_element(RMAP_NODE, &no_match_peer_rt_policy_cmd);
 
 	hook_register(bgp_hook_config_write_debug, prp_config_write_debug);
 

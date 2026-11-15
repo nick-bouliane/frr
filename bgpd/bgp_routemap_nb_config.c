@@ -637,6 +637,105 @@ lib_route_map_entry_match_condition_rmap_match_condition_source_vrf_destroy(
 	return NB_OK;
 }
 
+int lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_create(
+	struct nb_cb_create_args *args)
+{
+	return NB_OK;
+}
+
+int lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_destroy(
+	struct nb_cb_destroy_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		return lib_route_map_entry_match_destroy(args);
+	}
+
+	return NB_OK;
+}
+
+void lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_finish(
+	struct nb_cb_apply_finish_args *args)
+{
+	struct routemap_hook_context *rhc;
+	const char *policy;
+	bool reset_on_violation;
+	char *argstr;
+	enum rmap_compile_rets ret;
+
+	rhc = nb_running_get_entry(args->dnode, NULL, true);
+	policy = yang_dnode_get_string(args->dnode, "policy-name");
+	reset_on_violation = yang_dnode_exists(args->dnode,
+					      "reset-on-violation") &&
+				     yang_dnode_get_bool(args->dnode,
+							 "reset-on-violation");
+
+	rhc->rhc_mhook = bgp_route_match_delete;
+	rhc->rhc_rule = "peer-rt-policy";
+	rhc->rhc_event = RMAP_EVENT_MATCH_DELETED;
+
+	if (reset_on_violation) {
+		size_t arglen = strlen(policy) + sizeof(" reset-on-violation");
+
+		argstr = XMALLOC(MTYPE_ROUTE_MAP_COMPILED, arglen);
+		snprintf(argstr, arglen, "%s reset-on-violation", policy);
+	} else {
+		argstr = XSTRDUP(MTYPE_ROUTE_MAP_COMPILED, policy);
+	}
+
+	ret = bgp_route_match_add(rhc->rhc_rmi, "peer-rt-policy", argstr,
+				  RMAP_EVENT_MATCH_ADDED, args->errmsg,
+				  args->errmsg_len);
+	assert(ret == RMAP_COMPILE_SUCCESS);
+	XFREE(MTYPE_ROUTE_MAP_COMPILED, argstr);
+}
+
+int lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_policy_name_modify(
+	struct nb_cb_modify_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+	case NB_EV_APPLY:
+		break;
+	}
+
+	return NB_OK;
+}
+
+int lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_reset_on_violation_modify(
+	struct nb_cb_modify_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+	case NB_EV_APPLY:
+		break;
+	}
+
+	return NB_OK;
+}
+
+int lib_route_map_entry_match_condition_rmap_match_condition_peer_rt_policy_reset_on_violation_destroy(
+	struct nb_cb_destroy_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+	case NB_EV_APPLY:
+		break;
+	}
+
+	return NB_OK;
+}
+
 /*
  * XPath: /frr-route-map:lib/route-map/entry/match-condition/rmap-match-condition/frr-bgp-route-map:peer-ipv4-address
  */
