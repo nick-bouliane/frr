@@ -740,6 +740,8 @@ def test_dynamic_aggr_detail_cli():
     logger.info("Check dynamic-aggr detail introspection CLI")
     output = tgen.gears["rr"].vtysh_cmd("show dynamic-aggregate detail")
     assert "=== Dynamic Aggregate Detail ===" in output
+    assert "observe-only=no" in output
+    assert "=== Static Aggregate Actions ===" in output
     assert "=== Scoped Dynamic Detail ===" in output
     assert "=== Global Dynamic Detail ===" in output
 
@@ -750,6 +752,16 @@ def test_dynamic_aggr_detail_cli():
     output = tgen.gears["rr"].vtysh_cmd("show dynamic-aggregate detail global")
     assert "=== Global Dynamic Detail ===" in output
     assert "=== Scoped Dynamic Detail ===" not in output
+
+
+def test_dynamic_aggr_observe_only_mode_must_be_static():
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    logger.info("Reject enabling observe-only after aggregate config is present")
+    output = _rr_config(["observe-only"])
+    assert "configure observe-only before grids, aggregates, or dynamic nexthop anchor" in output
 
 
 def test_dynamic_aggr_config_write():

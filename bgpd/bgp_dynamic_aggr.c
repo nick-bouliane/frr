@@ -186,6 +186,7 @@ struct dynaggr_config {
 	bool has_community_asn;
 	bool has_rd_id_base;
 	bool enabled;
+	bool observe_only;
 };
 
 static struct grid *grids;
@@ -436,7 +437,7 @@ static void suppress_path(struct bgp *bgp_evpn, struct bgp_path_info *pi)
 {
 	struct bgp_path_info_extra *pie;
 
-	if (!pi)
+	if (dynaggr_cfg.observe_only || !pi)
 		return;
 
 	pie = bgp_path_info_extra_get(pi);
@@ -460,7 +461,7 @@ static void suppress_path(struct bgp *bgp_evpn, struct bgp_path_info *pi)
  */
 static void unsuppress_path(struct bgp *bgp_evpn, struct bgp_path_info *pi)
 {
-	if (!pi || !pi->extra || !pi->extra->aggr_suppressors)
+	if (dynaggr_cfg.observe_only || !pi || !pi->extra || !pi->extra->aggr_suppressors)
 		return;
 
 	if (!listnode_lookup(pi->extra->aggr_suppressors, &dynaggr_suppressor_tag))
@@ -1098,6 +1099,9 @@ static void inject_aggregate_instance(const struct prefix *aggr_pfx, struct grid
 	struct ecommunity *rt_ecom;
 	struct community *comm;
 
+	if (dynaggr_cfg.observe_only)
+		return;
+
 	bgp_evpn = bgp_get_evpn();
 	if (!bgp_evpn)
 		return;
@@ -1218,6 +1222,9 @@ static void remove_aggregate_instance(const struct prefix *aggr_pfx, struct grid
 	struct prefix_evpn evp;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+
+	if (dynaggr_cfg.observe_only)
+		return;
 
 	bgp_evpn = bgp_get_evpn();
 	if (!bgp_evpn)
@@ -1964,7 +1971,8 @@ static bool dynaggr_path_to_ip_prefix(const struct bgp_path_info *pi, struct pre
  */
 static void dynaggr_show_tnode_detail(struct vty *vty, const struct global_dynaggr_tnode *n,
 				      uint32_t addr, uint8_t depth, const char *tree_prefix,
-				      const char *edge_label, bool is_last)
+				      const char *edge_label, bool is_last,
+				      bool covered_by_aggregate)
 {
 	const struct global_dynaggr_tnode *view_n;
 	uint32_t view_addr;
@@ -1974,6 +1982,10 @@ static void dynaggr_show_tnode_detail(struct vty *vty, const struct global_dynag
 	bool have0;
 	bool have1;
 	bool route_suppressed;
+	bool route_would_be_suppressed;
+	bool child_covered_by_aggregate;
+	const char *aggregate_action;
+	const char *route_action;
 	struct prefix node_pfx;
 
 	if (!n)
@@ -2005,22 +2017,31 @@ static void dynaggr_show_tnode_detail(struct vty *vty, const struct global_dynag
 
 	node_pfx = make_prefix_hbo(view_addr, view_depth);
 	route_suppressed = view_n->path ? dynaggr_path_is_suppressed(view_n->path) : false;
+	child_covered_by_aggregate = covered_by_aggregate || view_n->is_aggregate;
+	route_would_be_suppressed = dynaggr_cfg.observe_only && child_covered_by_aggregate;
+	aggregate_action = !view_n->is_aggregate
+			   ? "none"
+			   : (dynaggr_cfg.observe_only ? "would-advertise" : "announced");
+	route_action = !view_n->path
+			? "none"
+			: (route_would_be_suppressed
+				   ? "would-suppress"
+				   : (route_suppressed ? "suppressed" : "announced"));
 
 	if (edge_label && edge_label[0] != '\0') {
 		vty_out(vty,
-			"%s%s%s node %pFX aggregate=%s route=%s leaf=%s compressed-skip=%u\n",
+			"%s%s%s node %pFX aggregate=%s action=%s route=%s leaf=%s compressed-skip=%u\n",
 			tree_prefix ? tree_prefix : "", is_last ? "`--" : "|--", edge_label,
-			&node_pfx, view_n->is_aggregate ? "yes" : "no",
-			view_n->path ? (route_suppressed ? "suppressed" : "announced") : "none",
+			&node_pfx, view_n->is_aggregate ? "yes" : "no", aggregate_action,
+			route_action,
 			view_n->path ? "yes" : "no", n->num_skipped);
 		snprintf(content_prefix, sizeof(content_prefix), "%s%s",
 			 tree_prefix ? tree_prefix : "", is_last ? "   " : "|  ");
 	} else {
 		vty_out(vty,
-			"%snode %pFX aggregate=%s route=%s leaf=%s compressed-skip=%u\n",
+			"%snode %pFX aggregate=%s action=%s route=%s leaf=%s compressed-skip=%u\n",
 			tree_prefix ? tree_prefix : "", &node_pfx,
-			view_n->is_aggregate ? "yes" : "no",
-			view_n->path ? (route_suppressed ? "suppressed" : "announced") : "none",
+			view_n->is_aggregate ? "yes" : "no", aggregate_action, route_action,
 			view_n->path ? "yes" : "no", n->num_skipped);
 		snprintf(content_prefix, sizeof(content_prefix), "%s",
 			 tree_prefix ? tree_prefix : "");
@@ -2032,12 +2053,13 @@ static void dynaggr_show_tnode_detail(struct vty *vty, const struct global_dynag
 
 	if (have0)
 		dynaggr_show_tnode_detail(vty, view_n->child[0], view_addr, view_depth + 1,
-					  child_prefix, "0", !have1);
+					  child_prefix, "0", !have1, child_covered_by_aggregate);
 	if (have1)
 		dynaggr_show_tnode_detail(vty, view_n->child[1],
 					  view_addr | (view_depth < 32 ? (1u << (31 - view_depth))
 								       : 0),
-					  view_depth + 1, child_prefix, "1", true);
+					  view_depth + 1, child_prefix, "1", true,
+					  child_covered_by_aggregate);
 }
 
 /*
@@ -2138,9 +2160,24 @@ DEFUN(show_dynamic_aggregate_detail, show_dynamic_aggregate_detail_cmd,
 	}
 
 	vty_out(vty, "=== Dynamic Aggregate Detail ===\n");
-	vty_out(vty, "enabled=%s site-id=%u community-asn=%u rd-id-base=%u\n",
-		dynaggr_cfg.enabled ? "yes" : "no", dynaggr_cfg.site_id, dynaggr_cfg.community_asn,
-		dynaggr_cfg.rd_id_base);
+	vty_out(vty,
+		"enabled=%s observe-only=%s site-id=%u community-asn=%u rd-id-base=%u\n",
+		dynaggr_cfg.enabled ? "yes" : "no", dynaggr_cfg.observe_only ? "yes" : "no",
+		dynaggr_cfg.site_id, dynaggr_cfg.community_asn, dynaggr_cfg.rd_id_base);
+
+	vty_out(vty, "\n=== Static Aggregate Actions ===\n");
+	for (i = 0; i < num_static_aggregates; i++) {
+		const char *grid_name = static_aggregates[i].grid
+					? static_aggregates[i].grid->name
+						: static_aggregates[i].grid_name;
+		const char *action = dynaggr_cfg.observe_only
+				     ? "would-advertise"
+				     : (static_aggregates_originated ? "announced" : "pending");
+
+		vty_out(vty, "  %pFX grid=%s vni=%u action=%s\n", &static_aggregates[i].prefix,
+			grid_name ? grid_name : "-", static_aggregates[i].vni,
+			action);
+	}
 
 	if (show_scoped) {
 		vty_out(vty, "\n=== Scoped Dynamic Detail ===\n");
@@ -2152,39 +2189,54 @@ DEFUN(show_dynamic_aggregate_detail, show_dynamic_aggregate_detail_cmd,
 
 			for (b = scoped_dynaggr_supernets[i].grid_buckets; b; b = b->next) {
 				vty_out(vty,
-					"  Bucket grid=%s vni=%u slices=%u active-aggregates=%u\n",
+					"  Bucket grid=%s vni=%u slices=%u %s=%u\n",
 					b->grid ? b->grid->name : "-", b->vni, b->num_slices,
+					dynaggr_cfg.observe_only ? "candidate-aggregates" : "active-aggregates",
 					b->num_active_aggregates);
 
 				for (j = 0; j < b->total_slots; j++) {
 					struct bgp_path_info *pi = b->slot_paths[j];
 					struct prefix slot_pfx;
+					bool would_suppress = false;
+					bool has_route_prefix;
+					uint32_t aggregate_index;
+					const char *route_action;
 
 					if (!pi)
 						continue;
 
 					slot_pfx = scoped_dynaggr_slot_prefix(&scoped_dynaggr_supernets[i],
 								     j);
-					if (dynaggr_path_to_ip_prefix(pi, &slot_pfx)) {
-						vty_out(vty,
-							"    slot[%u] contributor=%pFX suppressed=%s\n",
-							j, &slot_pfx,
-							dynaggr_path_is_suppressed(pi) ? "yes"
-										       : "no");
-					} else {
+					has_route_prefix = dynaggr_path_to_ip_prefix(pi, &slot_pfx);
+					if (!has_route_prefix)
 						slot_pfx = scoped_dynaggr_slot_prefix(&scoped_dynaggr_supernets[i],
-								     j);
-						vty_out(vty,
-							"    slot[%u] contributor=%pFX suppressed=%s (fallback-prefix)\n",
-							j, &slot_pfx,
-							dynaggr_path_is_suppressed(pi) ? "yes"
-										       : "no");
+									     j);
+
+					if (dynaggr_cfg.observe_only) {
+						for (aggregate_index = 0;
+						     aggregate_index < b->num_active_aggregates;
+						     aggregate_index++) {
+							if (prefix_match(&b->active_aggregates[aggregate_index],
+								 &slot_pfx)) {
+								would_suppress = true;
+								break;
+							}
+						}
 					}
+
+					route_action = dynaggr_cfg.observe_only
+						       ? (would_suppress ? "would-suppress" : "announced")
+						       : (dynaggr_path_is_suppressed(pi) ? "suppressed"
+											 : "announced");
+					vty_out(vty, "    slot[%u] contributor=%pFX route=%s%s\n", j,
+						&slot_pfx, route_action,
+						has_route_prefix ? "" : " (fallback-prefix)");
 				}
 
 				for (j = 0; j < b->num_active_aggregates; j++)
-					vty_out(vty, "    aggregate[%u]=%pFX announced=yes\n", j,
-						&b->active_aggregates[j]);
+					vty_out(vty, "    aggregate[%u]=%pFX action=%s\n", j,
+						&b->active_aggregates[j],
+						dynaggr_cfg.observe_only ? "would-advertise" : "announced");
 			}
 		}
 	}
@@ -2204,11 +2256,13 @@ DEFUN(show_dynamic_aggregate_detail, show_dynamic_aggregate_detail_cmd,
 				gb->grid ? gb->grid->name : "-", gb->vni);
 
 			for (sb = gb->tree_slices; sb; sb = sb->next) {
-				vty_out(vty, "  slice /%u leaves=%u active-aggregates=%u\n",
+				vty_out(vty, "  slice /%u leaves=%u %s=%u\n",
 					sb->slice_prefixlen, sb->tree_leaf_count,
+					dynaggr_cfg.observe_only ? "candidate-aggregates"
+								: "active-aggregates",
 					sb->num_active_aggregates);
-				dynaggr_show_tnode_detail(vty, sb->tree_root, 0, 0, "    ", "",
-							  true);
+				dynaggr_show_tnode_detail(vty, sb->tree_root, 0, 0, "    ", "", true,
+							  false);
 			}
 		}
 	}
@@ -2235,6 +2289,11 @@ static bool dynaggr_has_dependent_config(void)
 {
 	return num_grids > 0 || num_static_aggregates > 0 || num_scoped_dynaggr_supernets > 0 ||
 	       num_global_dynaggr_rules > 0;
+}
+
+static bool dynaggr_observe_only_locked(void)
+{
+	return dynaggr_has_dependent_config() || dynaggr_nexthop_anchor_set;
 }
 
 /*
@@ -2655,6 +2714,7 @@ static void dynaggr_clear_config_data(void)
 	dynaggr_cfg.has_site_id = false;
 	dynaggr_cfg.has_community_asn = false;
 	dynaggr_cfg.has_rd_id_base = false;
+	dynaggr_cfg.observe_only = false;
 	dynaggr_nexthop_free_all();
 	dynaggr_nexthop_anchor_set = false;
 	memset(&dynaggr_nexthop_anchor, 0, sizeof(dynaggr_nexthop_anchor));
@@ -2714,6 +2774,8 @@ static int dynaggr_config_write(struct vty *vty)
 		return 1;
 
 	vty_out(vty, "dynamic-aggr\n");
+	if (dynaggr_cfg.observe_only)
+		vty_out(vty, " observe-only\n");
 	if (dynaggr_cfg.has_site_id)
 		vty_out(vty, " site-id %u\n", dynaggr_cfg.site_id);
 	if (dynaggr_cfg.has_community_asn)
@@ -2758,6 +2820,41 @@ DEFUN(dynamic_aggr, dynamic_aggr_cmd,
 {
 	dynaggr_cfg.enabled = true;
 	vty->node = DYNAGGR_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUN(dynaggr_observe_only, dynaggr_observe_only_cmd,
+	  "observe-only",
+	  "Observe aggregation state without changing advertised routes\n")
+{
+	if (dynaggr_cfg.observe_only)
+		return CMD_SUCCESS;
+
+	if (dynaggr_observe_only_locked()) {
+		vty_out(vty,
+			"%% configure observe-only before grids, aggregates, or dynamic nexthop anchor\n");
+		return CMD_WARNING;
+	}
+
+	dynaggr_cfg.observe_only = true;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_dynaggr_observe_only, no_dynaggr_observe_only_cmd,
+	  "no observe-only",
+	  NO_STR
+	  "Observe aggregation state without changing advertised routes\n")
+{
+	if (!dynaggr_cfg.observe_only)
+		return CMD_SUCCESS;
+
+	if (dynaggr_observe_only_locked()) {
+		vty_out(vty,
+			"%% remove grids, aggregates, and dynamic nexthop anchor before changing observe-only\n");
+		return CMD_WARNING;
+	}
+
+	dynaggr_cfg.observe_only = false;
 	return CMD_SUCCESS;
 }
 
@@ -3254,6 +3351,10 @@ void bgp_dynamic_aggr_init(void)
 		install_element(BGP_NODE, &no_dynamic_aggr_cmd);
 		install_element(DYNAGGR_NODE, &dynaggr_site_id_cmd);
 		install_element(DYNAGGR_NODE, &no_dynaggr_site_id_cmd);
+		install_element(DYNAGGR_NODE, &dynaggr_observe_only_cmd);
+		install_element(DYNAGGR_NODE, &no_dynaggr_observe_only_cmd);
+		install_element(CONFIG_NODE, &dynaggr_observe_only_cmd);
+		install_element(CONFIG_NODE, &no_dynaggr_observe_only_cmd);
 		install_element(CONFIG_NODE, &dynaggr_site_id_cmd);
 		install_element(CONFIG_NODE, &no_dynaggr_site_id_cmd);
 		install_element(DYNAGGR_NODE, &dynaggr_community_asn_cmd);
