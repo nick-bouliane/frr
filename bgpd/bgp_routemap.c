@@ -2336,17 +2336,32 @@ route_match_nexthop_fanout(void *rule, const struct prefix *prefix,
 	if (!fanout || fanout->total_t2s == 0)
 		return RMAP_MATCH;
 
-	if (!path || !path->peer || !path->peer->connection || !path->attr)
+	if (!path || !path->attr)
 		return RMAP_MATCH;
 
 	/*
-	 * Hash the destination peer address (path->peer).  In the outbound
-	 * route-map context this is the target DPU — constant for all
-	 * routes in the update group but different across DPUs, so each
-	 * DPU gets a distinct set of fanout winners.
+	 * Hash the source peer address (path->from).  In the outbound
+	 * route-map context path->peer is SUBGRP_PEER — a configuration
+	 * template whose connection->su has no real socket address.
+	 * path->from is the actual source peer (VTEP) that originated
+	 * the route, so its address varies per nexthop and produces a
+	 * meaningful hash.
+	 *
+	 * Note: since the outbound route-map is evaluated once per update
+	 * subgroup, all destination peers in the same subgroup receive
+	 * the same fanout result.
 	 */
-	peer_addr = sockunion_get_addr(&path->peer->connection->su);
-	peer_addrlen = sockunion_get_addrlen(&path->peer->connection->su);
+	if (!path->from || !path->from->connection) {
+		if (!path->peer || !path->peer->connection)
+			return RMAP_MATCH;
+		peer_addr = sockunion_get_addr(&path->peer->connection->su);
+		peer_addrlen = sockunion_get_addrlen(
+			&path->peer->connection->su);
+	} else {
+		peer_addr = sockunion_get_addr(&path->from->connection->su);
+		peer_addrlen = sockunion_get_addrlen(
+			&path->from->connection->su);
+	}
 	if (!peer_addr || !peer_addrlen ||
 	    nexthop_fanout_addr_is_zero(peer_addr, peer_addrlen))
 		return RMAP_MATCH;
