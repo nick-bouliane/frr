@@ -2339,12 +2339,32 @@ route_match_nexthop_fanout(void *rule, const struct prefix *prefix,
 	if (!path || !path->peer || !path->peer->connection || !path->attr)
 		return RMAP_MATCH;
 
-	peer_addr = sockunion_get_addr(&path->peer->connection->su);
-	peer_addrlen = sockunion_get_addrlen(&path->peer->connection->su);
+	/*
+	 * In the outbound route-map context path->peer is the destination
+	 * peer (constant for every route in the update group) while
+	 * path->from is the source peer whose address varies per VTEP.
+	 * Prefer path->from when set so the hash spreads across sources.
+	 */
+	if (path->from && path->from->connection) {
+		peer_addr = sockunion_get_addr(&path->from->connection->su);
+		peer_addrlen = sockunion_get_addrlen(
+			&path->from->connection->su);
+	} else {
+		peer_addr = sockunion_get_addr(&path->peer->connection->su);
+		peer_addrlen = sockunion_get_addrlen(
+			&path->peer->connection->su);
+	}
 	if (!peer_addr || !peer_addrlen ||
 	    nexthop_fanout_addr_is_zero(peer_addr, peer_addrlen))
 		return RMAP_MATCH;
 
+	/*
+	 * Extract the VTEP nexthop.  subgroup_announce_check() may have
+	 * overwritten mp_nexthop_len to IPV6 (for ENHE) while the real
+	 * tunnel IP is still in mp_nexthop_global_in.  Try the IPv6 field
+	 * first when the length says IPv6; fall back to the IPv4 field if
+	 * the IPv6 address is all-zero.
+	 */
 	switch (path->attr->mp_nexthop_len) {
 	case BGP_ATTR_NHLEN_IPV4:
 	case BGP_ATTR_NHLEN_VPNV4:
@@ -2357,6 +2377,11 @@ route_match_nexthop_fanout(void *rule, const struct prefix *prefix,
 	case BGP_ATTR_NHLEN_VPNV6_GLOBAL_AND_LL:
 		nexthop = &path->attr->mp_nexthop_global;
 		nexthop_len = IPV6_MAX_BYTELEN;
+		if (nexthop_fanout_addr_is_zero(nexthop, nexthop_len) &&
+		    path->attr->mp_nexthop_global_in.s_addr != INADDR_ANY) {
+			nexthop = &path->attr->mp_nexthop_global_in;
+			nexthop_len = IPV4_MAX_BYTELEN;
+		}
 		break;
 	default:
 		return RMAP_MATCH;
