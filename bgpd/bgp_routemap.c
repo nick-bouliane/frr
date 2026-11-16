@@ -2340,20 +2340,13 @@ route_match_nexthop_fanout(void *rule, const struct prefix *prefix,
 		return RMAP_MATCH;
 
 	/*
-	 * In the outbound route-map context path->peer is the destination
-	 * peer (constant for every route in the update group) while
-	 * path->from is the source peer whose address varies per VTEP.
-	 * Prefer path->from when set so the hash spreads across sources.
+	 * Hash the destination peer address (path->peer).  In the outbound
+	 * route-map context this is the target DPU — constant for all
+	 * routes in the update group but different across DPUs, so each
+	 * DPU gets a distinct set of fanout winners.
 	 */
-	if (path->from && path->from->connection) {
-		peer_addr = sockunion_get_addr(&path->from->connection->su);
-		peer_addrlen = sockunion_get_addrlen(
-			&path->from->connection->su);
-	} else {
-		peer_addr = sockunion_get_addr(&path->peer->connection->su);
-		peer_addrlen = sockunion_get_addrlen(
-			&path->peer->connection->su);
-	}
+	peer_addr = sockunion_get_addr(&path->peer->connection->su);
+	peer_addrlen = sockunion_get_addrlen(&path->peer->connection->su);
 	if (!peer_addr || !peer_addrlen ||
 	    nexthop_fanout_addr_is_zero(peer_addr, peer_addrlen))
 		return RMAP_MATCH;
