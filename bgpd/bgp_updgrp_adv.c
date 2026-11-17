@@ -55,7 +55,7 @@ int bgp_adj_out_hash_cmp(const struct bgp_adj_out *a, const struct bgp_adj_out *
 
 uint32_t bgp_adj_out_hash_hashfn(const struct bgp_adj_out *adj)
 {
-	uintptr_t p = (uintptr_t)adj->subgroup;
+	uint64_t p = (uint64_t)(uintptr_t)adj->subgroup;
 
 	return jhash_2words((uint32_t)(p ^ (p >> 32)), adj->addpath_tx_id,
 			    0x55aa5a5a);
