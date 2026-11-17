@@ -566,6 +566,18 @@ struct bgp_clearing_info {
 #define BGP_IPV6_SAFI_SUPPORTS_NEXTHOP_PREFER_GLOBAL(safi)                                        \
 	((safi) == SAFI_UNICAST || (safi) == SAFI_MULTICAST || (safi) == SAFI_LABELED_UNICAST)
 
+/* Nexthop fanout module config — see bgp_fanout.c */
+#define BGP_FANOUT_MAX_GROUPS 16
+struct bgp_fanout_config {
+	bool enabled;
+	uint32_t threshold;
+	uint32_t total;
+	uint32_t metric_winner;
+	uint32_t metric_loser;
+	uint8_t num_groups;
+	char *group_names[BGP_FANOUT_MAX_GROUPS];
+};
+
 /* BGP instance structure.  */
 struct bgp {
 	/* AS number of this BGP instance.  */
@@ -1126,6 +1138,9 @@ struct bgp {
 	uint64_t bestpath_runs;
 	uint64_t node_already_on_queue;
 	uint64_t node_deferred_on_queue;
+
+	/* Nexthop fanout module configuration (see bgp_fanout.c) */
+	struct bgp_fanout_config fanout_cfg;
 
 	QOBJ_FIELDS;
 };

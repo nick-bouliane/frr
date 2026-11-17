@@ -72,6 +72,7 @@
 #include "bgpd/bgp_io.h"
 #include "bgpd/bgp_ecommunity.h"
 #include "bgpd/bgp_flowspec.h"
+#include "bgpd/bgp_fanout.h"
 #include "bgpd/bgp_labelpool.h"
 #include "bgpd/bgp_pbr.h"
 #include "bgpd/bgp_addpath.h"
@@ -9478,6 +9479,7 @@ void bgp_init(unsigned short instance)
 #endif
 	bgp_ethernetvpn_init();
 	bgp_flowspec_vty_init();
+	bgp_fanout_init();
 
 	/* Access list initialize. */
 	access_list_init();

@@ -120,6 +120,11 @@ DEFINE_HOOK(bgp_route_update,
 	     struct bgp_path_info *old_route, struct bgp_path_info *new_route),
 	    (bgp, afi, safi, bn, old_route, new_route));
 
+DEFINE_HOOK(bgp_announce_peer,
+	    (struct peer *peer, const struct prefix *p,
+	     struct bgp_path_info *pi, struct attr *attr),
+	    (peer, p, pi, attr));
+
 /* Extern from bgp_dump.c */
 extern const char *bgp_origin_str[];
 extern const char *bgp_origin_long_str[];
@@ -3789,6 +3794,13 @@ void subgroup_process_announce_selected(struct update_subgroup *subgrp,
 	if (selected) {
 		if (subgroup_announce_check(dest, selected, subgrp, p, pattr,
 					    NULL)) {
+			/* Let registered modules inspect/modify attributes
+			 * (e.g. fanout MED tagging) before queuing the route.
+			 */
+			hook_call(bgp_announce_peer,
+				  onlypeer ? onlypeer : peer,
+				  p, selected, pattr);
+
 			/* Route is selected, if the route is already installed
 			 * in FIB, then it is advertised
 			 */

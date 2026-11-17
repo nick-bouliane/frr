@@ -785,6 +785,16 @@ DECLARE_HOOK(bgp_route_update,
 	      struct bgp_path_info *old_route, struct bgp_path_info *new_route),
 	     (bgp, afi, safi, bn, old_route, new_route));
 
+/* called after subgroup_announce_check() succeeds, before adj-RIB-out insert.
+ * Modules may inspect or modify attr (e.g. set MED for fanout diversity).
+ * peer is the real destination peer (onlypeer for solo subgroups).
+ * pi->attr has the original unmodified path attributes.
+ */
+DECLARE_HOOK(bgp_announce_peer,
+	     (struct peer *peer, const struct prefix *p,
+	      struct bgp_path_info *pi, struct attr *attr),
+	     (peer, p, pi, attr));
+
 extern int bgp_pi_hash_cmp(const struct bgp_path_info *p1, const struct bgp_path_info *p2);
 extern uint32_t bgp_pi_hash_hashfn(const struct bgp_path_info *pi);
 
