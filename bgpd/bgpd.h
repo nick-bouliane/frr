@@ -1051,6 +1051,8 @@ struct bgp {
 
 	/* Process Queue for handling routes */
 	struct work_queue *process_queue;
+	struct work_queue *fanout_queue;
+	struct hash *fanout_generations;
 
 	/* Meta Queue Information */
 	struct meta_queue *mq;

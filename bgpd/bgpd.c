@@ -4732,6 +4732,8 @@ int bgp_delete(struct bgp *bgp)
 	}
 
 	if (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating) {
+		if (bgp->fanout_queue)
+			work_queue_free_and_null(&bgp->fanout_queue);
 		if (bgp->process_queue)
 			work_queue_free_and_null(&bgp->process_queue);
 		bgp_unlock(bgp); /* initial reference */
@@ -4771,6 +4773,9 @@ void bgp_free(struct bgp *bgp)
 	struct bgp_table *table;
 	struct bgp_dest *dest;
 	struct bgp_rmap *rmap;
+
+	if (bgp->fanout_queue)
+		work_queue_free_and_null(&bgp->fanout_queue);
 
 	QOBJ_UNREG(bgp);
 
@@ -4813,6 +4818,7 @@ void bgp_free(struct bgp *bgp)
 	bf_release_index(bm->rd_idspace, bgp->vrf_rd_id);
 
 	bgp_evpn_cleanup(bgp);
+	hash_clean_and_free(&bgp->fanout_generations, NULL);
 	bgp_pbr_cleanup(bgp);
 	bgp_ls_cleanup(bgp);
 	bgp_addpath_finish_bgp_data(&bgp->tx_addpath);

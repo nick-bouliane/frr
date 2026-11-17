@@ -21,6 +21,7 @@
 #include "queue.h"
 #include "routemap.h"
 #include "filter.h"
+#include "workqueue.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_table.h"
@@ -180,8 +181,8 @@ subgrp_announce_addpath_best_selected(struct bgp_dest *dest,
 		list_delete(&list);
 }
 
-static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
-					  struct update_subgroup *subgrp)
+static void subgrp_withdraw_stale_addpath(struct bgp_dest *dest,
+						  struct update_subgroup *subgrp)
 {
 	struct bgp_adj_out *adj, *adj_next;
 	uint32_t id;
@@ -192,11 +193,11 @@ static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
 
 	/* Look through all of the paths we have advertised for this rn and send
 	 * a withdraw for the ones that are no longer present */
-	RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &ctx->dest->adj_out, adj_next) {
+	RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &dest->adj_out, adj_next) {
 		if (adj->subgroup != subgrp)
 			continue;
 
-		for (pi = bgp_dest_get_bgp_path_info(ctx->dest); pi;
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi;
 		     pi = pi->next) {
 			id = bgp_addpath_id_for_peer(peer, afi, safi,
 						     &pi->tx_addpath);
@@ -208,98 +209,331 @@ static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
 
 		if (!pi) {
 			subgroup_process_announce_selected(subgrp, NULL,
-							   ctx->dest, afi, safi,
+							   dest, afi, safi,
 							   adj->addpath_tx_id);
 		}
 	}
 }
 
-static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
+struct group_announce_generation {
+	struct bgp *bgp;
+	struct bgp_dest *dest;
+	afi_t afi;
+	safi_t safi;
+	uint64_t generation;
+	uint32_t refs;
+};
+
+struct group_announce_subgroup {
+	uint64_t id;
+	struct list *peers;
+};
+
+struct group_announce_context {
+	struct updwalk_context walk;
+	struct group_announce_generation *state;
+	uint64_t generation;
+	struct list *subgroups;
+	struct listnode *next;
+	afi_t afi;
+	safi_t safi;
+};
+
+struct group_announce_count {
+	uint32_t subgroups;
+};
+
+#define GROUP_ANNOUNCE_BATCH_SIZE 32
+
+static unsigned int group_announce_generation_hash(const void *data)
 {
-	struct updwalk_context *ctx = arg;
-	struct update_subgroup *subgrp;
+	const struct group_announce_generation *state = data;
+	unsigned int hash;
+
+	hash = jhash(&state->dest, sizeof(state->dest), 0);
+	return jhash_2words(state->afi, state->safi, hash);
+}
+
+static bool group_announce_generation_cmp(const void *data1, const void *data2)
+{
+	const struct group_announce_generation *state1 = data1;
+	const struct group_announce_generation *state2 = data2;
+
+	return state1->dest == state2->dest && state1->afi == state2->afi &&
+	       state1->safi == state2->safi;
+}
+
+static void *group_announce_generation_alloc(void *data)
+{
+	const struct group_announce_generation *key = data;
+	struct group_announce_generation *state;
+
+	state = XCALLOC(MTYPE_BGP_UPDGRP, sizeof(*state));
+	state->bgp = key->bgp;
+	state->dest = key->dest;
+	state->afi = key->afi;
+	state->safi = key->safi;
+	return state;
+}
+
+static void group_announce_generation_invalidate(struct bgp *bgp,
+						struct bgp_dest *dest,
+						afi_t afi, safi_t safi)
+{
+	struct group_announce_generation key = {
+		.dest = dest,
+		.afi = afi,
+		.safi = safi,
+	};
+	struct group_announce_generation *state;
+
+	if (!bgp->fanout_generations)
+		return;
+
+	state = hash_lookup(bgp->fanout_generations, &key);
+	if (state)
+		state->generation++;
+}
+
+static struct group_announce_generation *group_announce_generation_get(
+	struct bgp *bgp, struct bgp_dest *dest, afi_t afi, safi_t safi,
+	uint64_t *generation)
+{
+	struct group_announce_generation key = {
+		.bgp = bgp,
+		.dest = dest,
+		.afi = afi,
+		.safi = safi,
+	};
+	struct group_announce_generation *state;
+
+	if (!bgp->fanout_generations)
+		bgp->fanout_generations = hash_create(
+			group_announce_generation_hash,
+			group_announce_generation_cmp,
+			"BGP route announce generations");
+
+	state = hash_get(bgp->fanout_generations, &key,
+			 group_announce_generation_alloc);
+	state->generation++;
+	state->refs++;
+	*generation = state->generation;
+	return state;
+}
+
+static void group_announce_generation_put(
+	struct group_announce_generation *state)
+{
+	struct bgp *bgp = state->bgp;
+
+	assert(state->refs > 0);
+	if (--state->refs)
+		return;
+
+	assert(hash_release(bgp->fanout_generations, state) == state);
+	XFREE(MTYPE_BGP_UPDGRP, state);
+}
+
+static void group_announce_route_subgroup(struct group_announce_context *ctx,
+					  struct update_subgroup *subgrp)
+{
 	afi_t afi;
 	safi_t safi;
 	struct peer *peer;
 	struct bgp_adj_out *adj, *adj_next;
 	bool addpath_capable;
 
-	afi = UPDGRP_AFI(updgrp);
-	safi = UPDGRP_SAFI(updgrp);
-	peer = UPDGRP_PEER(updgrp);
+	afi = SUBGRP_AFI(subgrp);
+	safi = SUBGRP_SAFI(subgrp);
+	peer = SUBGRP_PEER(subgrp);
 	addpath_capable = bgp_addpath_encode_tx(peer, afi, safi);
 
-	if (BGP_DEBUG(update, UPDATE_OUT))
-		zlog_debug("%s: afi=%s, safi=%s, p=%pBD", __func__,
-			   afi2str(afi), safi2str(safi), ctx->dest);
-
-	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
-		/* An update-group that uses addpath */
-		if (addpath_capable) {
-			/* Send withdrawals without waiting for coalesting timer
-			 * to expire.
-			 */
-			if (event_is_scheduled(subgrp->t_coalesce)) {
-				subgrp_withdraw_stale_addpath(ctx, subgrp);
-
-				goto done;
-			}
-
-			subgrp_withdraw_stale_addpath(ctx, subgrp);
-			subgrp_announce_addpath_best_selected(ctx->dest, subgrp);
-
-			/* Process the bestpath last so the
-			 * "show [ip] bgp neighbor x.x.x.x advertised" output shows
-			 * the attributes from the bestpath.
-			 */
-			if (ctx->pi)
-				subgroup_process_announce_selected(
-					subgrp, ctx->pi, ctx->dest, afi, safi,
-					bgp_addpath_id_for_peer(peer, afi, safi,
-								&ctx->pi->tx_addpath));
-		} else {
-			/* Send withdrawals without waiting for coalesting timer
-			 * to expire.
-			 */
-			if (event_is_scheduled(subgrp->t_coalesce)) {
-				if (!ctx->pi || CHECK_FLAG(ctx->pi->flags, BGP_PATH_UNUSEABLE)) {
-					RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &ctx->dest->adj_out,
-							 adj_next) {
-						if (adj->subgroup == subgrp) {
-							subgroup_process_announce_selected(
-								subgrp, NULL, ctx->dest, afi, safi,
-								adj->addpath_tx_id);
-						}
-					}
-				}
-
-				goto done;
-			}
-
-			if (ctx->pi) {
-				subgroup_process_announce_selected(
-					subgrp, ctx->pi, ctx->dest, afi, safi,
-					bgp_addpath_id_for_peer(peer, afi, safi,
-								&ctx->pi->tx_addpath));
-			} else {
-				RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &ctx->dest->adj_out,
-						 adj_next) {
-					if (adj->subgroup == subgrp) {
-						subgroup_process_announce_selected(subgrp, NULL,
-										   ctx->dest, afi,
-										   safi,
-										   adj->addpath_tx_id);
-					}
-				}
-			}
+	/* An update-group that uses addpath */
+	if (addpath_capable) {
+		/* Send withdrawals without waiting for coalescing timer expiry. */
+		if (event_is_scheduled(subgrp->t_coalesce)) {
+			subgrp_withdraw_stale_addpath(ctx->walk.dest, subgrp);
+			goto done;
 		}
 
-done:
-		/* Notify BGP Conditional advertisement */
-		bgp_notify_conditional_adv_scanner(subgrp);
+		subgrp_withdraw_stale_addpath(ctx->walk.dest, subgrp);
+		subgrp_announce_addpath_best_selected(ctx->walk.dest, subgrp);
+		if (ctx->walk.pi)
+			subgroup_process_announce_selected(
+				subgrp, ctx->walk.pi, ctx->walk.dest, afi, safi,
+				bgp_addpath_id_for_peer(peer, afi, safi,
+							&ctx->walk.pi->tx_addpath));
+	} else {
+		/* Send withdrawals without waiting for coalescing timer expiry. */
+		if (event_is_scheduled(subgrp->t_coalesce)) {
+			if (!ctx->walk.pi ||
+			    CHECK_FLAG(ctx->walk.pi->flags, BGP_PATH_UNUSEABLE)) {
+				RB_FOREACH_SAFE (adj, bgp_adj_out_rb,
+						 &ctx->walk.dest->adj_out, adj_next) {
+					if (adj->subgroup == subgrp)
+						subgroup_process_announce_selected(
+							subgrp, NULL, ctx->walk.dest,
+							afi, safi,
+							adj->addpath_tx_id);
+				}
+			}
+			goto done;
+		}
+
+		if (ctx->walk.pi) {
+			subgroup_process_announce_selected(
+				subgrp, ctx->walk.pi, ctx->walk.dest, afi, safi,
+				bgp_addpath_id_for_peer(peer, afi, safi,
+							&ctx->walk.pi->tx_addpath));
+		} else {
+			RB_FOREACH_SAFE (adj, bgp_adj_out_rb,
+					 &ctx->walk.dest->adj_out, adj_next) {
+				if (adj->subgroup == subgrp)
+					subgroup_process_announce_selected(
+						subgrp, NULL, ctx->walk.dest, afi,
+						safi, adj->addpath_tx_id);
+			}
+		}
+	}
+
+	done:
+	bgp_notify_conditional_adv_scanner(subgrp);
+}
+
+static int group_announce_route_count_cb(struct update_group *updgrp,
+						 void *arg)
+{
+	struct group_announce_count *count = arg;
+	struct update_subgroup *subgrp;
+
+	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
+		if (++count->subgroups > GROUP_ANNOUNCE_BATCH_SIZE)
+			return UPDWALK_ABORT;
 	}
 
 	return UPDWALK_CONTINUE;
+}
+
+static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
+{
+	struct group_announce_context *ctx = arg;
+	struct update_subgroup *subgrp;
+
+	if (BGP_DEBUG(update, UPDATE_OUT))
+		zlog_debug("%s: afi=%s, safi=%s, p=%pBD", __func__,
+			   afi2str(UPDGRP_AFI(updgrp)),
+			   safi2str(UPDGRP_SAFI(updgrp)), ctx->walk.dest);
+
+	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp)
+		group_announce_route_subgroup(ctx, subgrp);
+
+	return UPDWALK_CONTINUE;
+}
+
+static int group_announce_route_snapshot_cb(struct update_group *updgrp,
+						    void *arg)
+{
+	struct group_announce_context *ctx = arg;
+	struct group_announce_subgroup *entry;
+	struct update_subgroup *subgrp;
+	struct peer_af *paf;
+
+	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
+		if (subgrp->peer_count == 0)
+			continue;
+
+		entry = XCALLOC(MTYPE_BGP_UPDGRP, sizeof(*entry));
+		entry->id = subgrp->id;
+		entry->peers = list_new();
+		SUBGRP_FOREACH_PEER (subgrp, paf) {
+			peer_lock(paf->peer);
+			listnode_add(entry->peers, paf->peer);
+		}
+		listnode_add(ctx->subgroups, entry);
+	}
+
+	return UPDWALK_CONTINUE;
+}
+
+static struct update_subgroup *group_announce_find_subgroup(
+	struct group_announce_context *ctx, struct group_announce_subgroup *entry)
+{
+	struct peer *peer;
+	struct peer_af *paf;
+	struct listnode *node;
+	int afid = afindex(ctx->afi, ctx->safi);
+
+	for (ALL_LIST_ELEMENTS_RO(entry->peers, node, peer)) {
+		if (peer->bgp != ctx->state->bgp)
+			continue;
+		if (!peer->peer_af_array[afid])
+			continue;
+		paf = peer->peer_af_array[afid];
+		if (paf->subgroup && paf->subgroup->id == entry->id)
+			return paf->subgroup;
+	}
+	return NULL;
+}
+
+static void group_announce_context_free(struct group_announce_context *ctx)
+{
+	struct group_announce_subgroup *entry;
+	struct peer *peer;
+	struct listnode *node, *next, *peer_node;
+
+	for (ALL_LIST_ELEMENTS(ctx->subgroups, node, next, entry)) {
+		for (ALL_LIST_ELEMENTS_RO(entry->peers, peer_node, peer))
+			peer_unlock(peer);
+		list_delete(&entry->peers);
+		XFREE(MTYPE_BGP_UPDGRP, entry);
+	}
+	list_delete(&ctx->subgroups);
+	if (ctx->walk.pi)
+		bgp_path_info_unlock(ctx->walk.pi);
+	bgp_dest_unlock_node(ctx->walk.dest);
+	group_announce_generation_put(ctx->state);
+	XFREE(MTYPE_BGP_UPDGRP, ctx);
+}
+
+static void group_announce_queue_item_free(struct work_queue *wq, void *data)
+{
+	group_announce_context_free(data);
+}
+
+static wq_item_status group_announce_queue_process(struct work_queue *wq,
+						   void *data)
+{
+	struct group_announce_context *ctx = data;
+	struct group_announce_subgroup *entry;
+	struct update_subgroup *subgrp;
+	unsigned int processed = 0;
+
+	if (ctx->state->generation != ctx->generation)
+		return WQ_SUCCESS;
+
+	while (ctx->next && processed < GROUP_ANNOUNCE_BATCH_SIZE) {
+		entry = ctx->next->data;
+		ctx->next = listnextnode(ctx->next);
+		subgrp = group_announce_find_subgroup(ctx, entry);
+		if (subgrp)
+			group_announce_route_subgroup(ctx, subgrp);
+		processed++;
+	}
+
+	return ctx->next ? WQ_REQUEUE : WQ_SUCCESS;
+}
+
+static void group_announce_process_snapshot(struct group_announce_context *ctx)
+{
+	struct group_announce_subgroup *entry;
+	struct update_subgroup *subgrp;
+	struct listnode *node;
+
+	for (ALL_LIST_ELEMENTS_RO(ctx->subgroups, node, entry)) {
+		subgrp = group_announce_find_subgroup(ctx, entry);
+		if (subgrp)
+			group_announce_route_subgroup(ctx, subgrp);
+	}
 }
 
 static void subgrp_show_adjq_vty(struct update_subgroup *subgrp,
@@ -1182,17 +1416,66 @@ void subgroup_announce_all(struct update_subgroup *subgrp)
 void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 			  struct bgp_dest *dest, struct bgp_path_info *pi)
 {
-	struct updwalk_context ctx;
-	ctx.pi = pi;
-	ctx.dest = dest;
+	struct group_announce_context *ctx;
+	struct group_announce_generation *state;
+	struct group_announce_count count = {};
+	struct group_announce_context sync_ctx = {};
+	uint64_t generation;
+	char queue_name[BUFSIZ];
+
+	group_announce_generation_invalidate(bgp, dest, afi, safi);
 
 	/* If suppress fib is enabled, the route will be advertised when
 	 * FIB status is received
 	 */
-	if (!bgp_check_advertise(bgp, dest, safi))
+	if (!bgp_check_advertise(bgp, dest, safi)) {
 		return;
+	}
 
-	update_group_af_walk(bgp, afi, safi, group_announce_route_walkcb, &ctx);
+	update_group_af_walk(bgp, afi, safi, group_announce_route_count_cb,
+			     &count);
+	if (count.subgroups <= GROUP_ANNOUNCE_BATCH_SIZE) {
+		sync_ctx.walk.dest = dest;
+		sync_ctx.walk.pi = pi;
+		sync_ctx.afi = afi;
+		sync_ctx.safi = safi;
+		update_group_af_walk(bgp, afi, safi,
+				     group_announce_route_walkcb, &sync_ctx);
+		return;
+	}
+
+	state = group_announce_generation_get(bgp, dest, afi, safi,
+					     &generation);
+
+	ctx = XCALLOC(MTYPE_BGP_UPDGRP, sizeof(*ctx));
+	ctx->state = state;
+	ctx->generation = generation;
+	ctx->afi = afi;
+	ctx->safi = safi;
+	ctx->walk.dest = bgp_dest_lock_node(dest);
+	ctx->walk.pi = pi ? bgp_path_info_lock(pi) : NULL;
+	ctx->subgroups = list_new();
+	update_group_af_walk(bgp, afi, safi,
+			     group_announce_route_snapshot_cb, ctx);
+	ctx->next = listhead(ctx->subgroups);
+
+	if (listcount(ctx->subgroups) <= GROUP_ANNOUNCE_BATCH_SIZE) {
+		group_announce_process_snapshot(ctx);
+		group_announce_context_free(ctx);
+		return;
+	}
+
+	if (!bgp->fanout_queue) {
+		snprintf(queue_name, sizeof(queue_name), "fanout_queue %s",
+			 bgp->name_pretty);
+		bgp->fanout_queue = work_queue_new(bm->master, queue_name);
+		bgp->fanout_queue->spec.workfunc = group_announce_queue_process;
+		bgp->fanout_queue->spec.del_item_data =
+			group_announce_queue_item_free;
+		bgp->fanout_queue->spec.hold = 0;
+		bgp->fanout_queue->spec.yield = 10 * 1000L;
+	}
+	work_queue_add(bgp->fanout_queue, ctx);
 }
 
 void update_group_show_adj_queue(struct bgp *bgp, afi_t afi, safi_t safi,
