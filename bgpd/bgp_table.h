@@ -77,7 +77,7 @@ struct bgp_dest {
 
 	void *info;
 
-	struct bgp_adj_out_rb adj_out;
+	struct bgp_adj_out_hash_head adj_out;
 
 	struct bgp_adj_in *adj_in;
 
@@ -266,7 +266,7 @@ static inline struct bgp_dest *bgp_node_get(struct bgp_table *const table,
 		struct bgp_dest *dest = XCALLOC(MTYPE_BGP_NODE,
 						sizeof(struct bgp_dest));
 
-		RB_INIT(bgp_adj_out_rb, &dest->adj_out);
+		bgp_adj_out_hash_init(&dest->adj_out);
 		route_node_set_info(rn, dest);
 		dest->rn = rn;
 	}

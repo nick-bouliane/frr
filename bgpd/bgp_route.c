@@ -3804,10 +3804,10 @@ void subgroup_process_announce_selected(struct update_subgroup *subgrp,
 					 * Why should we keep Adj-RIB-Out with stale paths?
 					 */
 					if (!bgp_addpath_encode_tx(peer, afi, safi)) {
-						struct bgp_adj_out *adj, *adj_next;
+						struct bgp_adj_out *adj;
 
-						RB_FOREACH_SAFE (adj, bgp_adj_out_rb,
-								 &dest->adj_out, adj_next) {
+						frr_each_safe (bgp_adj_out_hash,
+							       &dest->adj_out, adj) {
 							if (adj->subgroup != subgrp)
 								continue;
 
@@ -16972,7 +16972,7 @@ static void show_adj_route(struct vty *vty, struct peer *peer, struct bgp_table 
 		} else if (type == bgp_show_adj_route_advertised) {
 			bool peer_found = false;
 
-			RB_FOREACH (adj, bgp_adj_out_rb, &dest->adj_out) {
+			frr_each (bgp_adj_out_hash, &dest->adj_out, adj) {
 				SUBGRP_FOREACH_PEER (adj->subgroup, paf) {
 					if (paf->peer == peer && adj->attr) {
 						bgp_attr_dup_into(&attr, adj->attr);
@@ -17142,7 +17142,7 @@ static void show_adj_route(struct vty *vty, struct peer *peer, struct bgp_table 
 				(*output_count)++;
 			}
 		} else if (type == bgp_show_adj_route_advertised) {
-			RB_FOREACH (adj, bgp_adj_out_rb, &dest->adj_out)
+			frr_each (bgp_adj_out_hash, &dest->adj_out, adj)
 				SUBGRP_FOREACH_PEER (adj->subgroup, paf) {
 					if (paf->peer != peer || !adj->attr)
 						continue;
@@ -17368,7 +17368,7 @@ static int peer_adj_routes_brief(struct vty *vty, struct peer *peer, afi_t afi, 
 			int multi_path_count = 0;
 			bool best_path_selected = false;
 
-			RB_FOREACH (adj, bgp_adj_out_rb, &dest->adj_out) {
+			frr_each (bgp_adj_out_hash, &dest->adj_out, adj) {
 				SUBGRP_FOREACH_PEER (adj->subgroup, paf) {
 					if (paf->peer != peer || !adj->attr)
 						continue;

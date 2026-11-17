@@ -118,6 +118,7 @@ inline struct bgp_dest *bgp_dest_unlock_node(struct bgp_dest *dest)
 		if (dest->srv6_unicast)
 			bgp_srv6_unicast_unregister_route(dest);
 
+		bgp_adj_out_hash_fini(&dest->adj_out);
 		XFREE(MTYPE_BGP_NODE, dest);
 		dest = NULL;
 		route_node_set_info(rn, NULL);
@@ -160,6 +161,7 @@ static void bgp_node_destroy(route_table_delegate_t *delegate,
 		if (dest->srv6_unicast)
 			bgp_srv6_unicast_unregister_route(dest);
 
+		bgp_adj_out_hash_fini(&dest->adj_out);
 		XFREE(MTYPE_BGP_NODE, dest);
 		route_node_set_info(node, NULL);
 	}

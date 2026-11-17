@@ -22,6 +22,8 @@
 #include "routemap.h"
 #include "filter.h"
 
+#include "jhash.h"
+
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_debug.h"
@@ -42,24 +44,22 @@
 /********************
  * PRIVATE FUNCTIONS
  ********************/
-static int bgp_adj_out_compare(const struct bgp_adj_out *o1,
-			       const struct bgp_adj_out *o2)
+int bgp_adj_out_hash_cmp(const struct bgp_adj_out *a, const struct bgp_adj_out *b)
 {
-	if (o1->subgroup < o2->subgroup)
+	if (a->subgroup != b->subgroup)
 		return -1;
-
-	if (o1->subgroup > o2->subgroup)
-		return 1;
-
-	if (o1->addpath_tx_id < o2->addpath_tx_id)
+	if (a->addpath_tx_id != b->addpath_tx_id)
 		return -1;
-
-	if (o1->addpath_tx_id > o2->addpath_tx_id)
-		return 1;
-
 	return 0;
 }
-RB_GENERATE(bgp_adj_out_rb, bgp_adj_out, adj_entry, bgp_adj_out_compare);
+
+uint32_t bgp_adj_out_hash_hashfn(const struct bgp_adj_out *adj)
+{
+	uintptr_t p = (uintptr_t)adj->subgroup;
+
+	return jhash_2words((uint32_t)(p ^ (p >> 32)), adj->addpath_tx_id,
+			    0x55aa5a5a);
+}
 
 static inline struct bgp_adj_out *adj_lookup(struct bgp_dest *dest,
 					     struct update_subgroup *subgrp,
@@ -75,7 +75,7 @@ static inline struct bgp_adj_out *adj_lookup(struct bgp_dest *dest,
 	lookup.subgroup = subgrp;
 	lookup.addpath_tx_id = addpath_tx_id;
 
-	return RB_FIND(bgp_adj_out_rb, &dest->adj_out, &lookup);
+	return bgp_adj_out_hash_find(&dest->adj_out, &lookup);
 }
 
 static void adj_free(struct bgp_adj_out *adj)
@@ -85,7 +85,7 @@ static void adj_free(struct bgp_adj_out *adj)
 	TAILQ_REMOVE(&(adj->subgroup->adjq), adj, subgrp_adj_train);
 	SUBGRP_DECR_STAT(adj->subgroup, adj_count);
 
-	RB_REMOVE(bgp_adj_out_rb, &adj->dest->adj_out, adj);
+	bgp_adj_out_hash_del(&adj->dest->adj_out, adj);
 	bgp_dest_unlock_node(adj->dest);
 
 	XFREE(MTYPE_BGP_ADJ_OUT, adj);
@@ -183,7 +183,7 @@ subgrp_announce_addpath_best_selected(struct bgp_dest *dest,
 static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
 					  struct update_subgroup *subgrp)
 {
-	struct bgp_adj_out *adj, *adj_next;
+	struct bgp_adj_out *adj;
 	uint32_t id;
 	struct bgp_path_info *pi;
 	afi_t afi = SUBGRP_AFI(subgrp);
@@ -192,7 +192,7 @@ static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
 
 	/* Look through all of the paths we have advertised for this rn and send
 	 * a withdraw for the ones that are no longer present */
-	RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &ctx->dest->adj_out, adj_next) {
+	frr_each_safe (bgp_adj_out_hash, &ctx->dest->adj_out, adj) {
 		if (adj->subgroup != subgrp)
 			continue;
 
@@ -221,7 +221,7 @@ static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
 	afi_t afi;
 	safi_t safi;
 	struct peer *peer;
-	struct bgp_adj_out *adj, *adj_next;
+	struct bgp_adj_out *adj;
 	bool addpath_capable;
 
 	afi = UPDGRP_AFI(updgrp);
@@ -263,8 +263,8 @@ static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
 			 */
 			if (event_is_scheduled(subgrp->t_coalesce)) {
 				if (!ctx->pi || CHECK_FLAG(ctx->pi->flags, BGP_PATH_UNUSEABLE)) {
-					RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &ctx->dest->adj_out,
-							 adj_next) {
+					frr_each_safe (bgp_adj_out_hash, &ctx->dest->adj_out,
+						       adj) {
 						if (adj->subgroup == subgrp) {
 							subgroup_process_announce_selected(
 								subgrp, NULL, ctx->dest, afi, safi,
@@ -282,8 +282,8 @@ static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
 					bgp_addpath_id_for_peer(peer, afi, safi,
 								&ctx->pi->tx_addpath));
 			} else {
-				RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &ctx->dest->adj_out,
-						 adj_next) {
+				frr_each_safe (bgp_adj_out_hash, &ctx->dest->adj_out,
+					       adj) {
 					if (adj->subgroup == subgrp) {
 						subgroup_process_announce_selected(subgrp, NULL,
 										   ctx->dest, afi,
@@ -324,7 +324,7 @@ static void subgrp_show_adjq_vty(struct update_subgroup *subgrp,
 	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
 		const struct prefix *dest_p = bgp_dest_get_prefix(dest);
 
-		RB_FOREACH (adj, bgp_adj_out_rb, &dest->adj_out) {
+		frr_each (bgp_adj_out_hash, &dest->adj_out, adj) {
 			if (adj->subgroup != subgrp)
 				continue;
 
@@ -491,7 +491,7 @@ struct bgp_adj_out *bgp_adj_out_alloc(struct update_subgroup *subgrp,
 	adj->subgroup = subgrp;
 	adj->addpath_tx_id = addpath_tx_id;
 
-	RB_INSERT(bgp_adj_out_rb, &dest->adj_out, adj);
+	bgp_adj_out_hash_add(&dest->adj_out, adj);
 	bgp_dest_lock_node(dest);
 	adj->dest = dest;
 

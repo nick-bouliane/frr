@@ -73,7 +73,7 @@ int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 			struct attr *attr = NULL;
 			struct peer_af *paf = NULL;
 
-			RB_FOREACH (adj, bgp_adj_out_rb, &rm->adj_out)
+			frr_each (bgp_adj_out_hash, &rm->adj_out, adj)
 				SUBGRP_FOREACH_PEER (adj->subgroup, paf) {
 					if (paf->peer != peer || !adj->attr)
 						continue;

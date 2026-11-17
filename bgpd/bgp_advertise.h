@@ -9,6 +9,7 @@
 #include "lib/typesafe.h"
 
 PREDECL_DLIST(bgp_adv_fifo);
+PREDECL_HASH(bgp_adj_out_hash);
 
 struct update_subgroup;
 struct bgp_advertise;
@@ -55,8 +56,8 @@ struct bgp_advertise_attr {
 
 /* BGP adjacency out.  */
 struct bgp_adj_out {
-	/* RB Tree of adjacency entries */
-	RB_ENTRY(bgp_adj_out) adj_entry;
+	/* Hash table linkage (per-dest hash of adj-out entries) */
+	struct bgp_adj_out_hash_item adj_entry;
 
 	/* Advertised subgroup.  */
 	struct update_subgroup *subgroup;
@@ -79,9 +80,11 @@ struct bgp_adj_out {
 	struct bgp_advertise *adv;
 };
 
-RB_HEAD(bgp_adj_out_rb, bgp_adj_out);
-RB_PROTOTYPE(bgp_adj_out_rb, bgp_adj_out, adj_entry,
-	     bgp_adj_out_compare);
+extern int bgp_adj_out_hash_cmp(const struct bgp_adj_out *a,
+				const struct bgp_adj_out *b);
+extern uint32_t bgp_adj_out_hash_hashfn(const struct bgp_adj_out *adj);
+DECLARE_HASH(bgp_adj_out_hash, struct bgp_adj_out, adj_entry,
+	     bgp_adj_out_hash_cmp, bgp_adj_out_hash_hashfn);
 
 /* BGP adjacency in. */
 struct bgp_adj_in {

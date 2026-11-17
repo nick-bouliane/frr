@@ -139,7 +139,7 @@ bool bgp_adj_out_lookup(struct peer *peer, struct bgp_dest *dest,
 	safi_t safi;
 	bool addpath_capable;
 
-	RB_FOREACH (adj, bgp_adj_out_rb, &dest->adj_out)
+	frr_each (bgp_adj_out_hash, &dest->adj_out, adj)
 		SUBGRP_FOREACH_PEER (adj->subgroup, paf)
 			if (paf->peer == peer) {
 				afi = SUBGRP_AFI(adj->subgroup);
