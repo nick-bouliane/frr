@@ -235,12 +235,9 @@ struct group_announce_context {
 	uint64_t generation;
 	struct list *subgroups;
 	struct listnode *next;
+	uint32_t count;
 	afi_t afi;
 	safi_t safi;
-};
-
-struct group_announce_count {
-	uint32_t subgroups;
 };
 
 #define GROUP_ANNOUNCE_BATCH_SIZE 32
@@ -274,6 +271,11 @@ static void *group_announce_generation_alloc(void *data)
 	state->afi = key->afi;
 	state->safi = key->safi;
 	return state;
+}
+
+void bgp_fanout_generation_free(void *data)
+{
+	XFREE(MTYPE_BGP_UPDGRP, data);
 }
 
 static void group_announce_generation_invalidate(struct bgp *bgp,
@@ -396,60 +398,51 @@ static void group_announce_route_subgroup(struct group_announce_context *ctx,
 		}
 	}
 
-	done:
+done:
 	bgp_notify_conditional_adv_scanner(subgrp);
 }
 
-static int group_announce_route_count_cb(struct update_group *updgrp,
-						 void *arg)
-{
-	struct group_announce_count *count = arg;
-	struct update_subgroup *subgrp;
-
-	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
-		if (++count->subgroups > GROUP_ANNOUNCE_BATCH_SIZE)
-			return UPDWALK_ABORT;
-	}
-
-	return UPDWALK_CONTINUE;
-}
-
+/*
+ * Single-pass walk callback: processes subgroups inline while count is
+ * within the batch size.  Once the batch threshold is exceeded, switches
+ * to snapshotting mode for the remainder so the caller can defer them
+ * to the fanout work queue.
+ */
 static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
-{
-	struct group_announce_context *ctx = arg;
-	struct update_subgroup *subgrp;
-
-	if (BGP_DEBUG(update, UPDATE_OUT))
-		zlog_debug("%s: afi=%s, safi=%s, p=%pBD", __func__,
-			   afi2str(UPDGRP_AFI(updgrp)),
-			   safi2str(UPDGRP_SAFI(updgrp)), ctx->walk.dest);
-
-	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp)
-		group_announce_route_subgroup(ctx, subgrp);
-
-	return UPDWALK_CONTINUE;
-}
-
-static int group_announce_route_snapshot_cb(struct update_group *updgrp,
-						    void *arg)
 {
 	struct group_announce_context *ctx = arg;
 	struct group_announce_subgroup *entry;
 	struct update_subgroup *subgrp;
 	struct peer_af *paf;
 
-	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
-		if (subgrp->peer_count == 0)
-			continue;
+	if (BGP_DEBUG(update, UPDATE_OUT))
+		zlog_debug("%s: afi=%s, safi=%s, p=%pBD", __func__,
+			   afi2str(UPDGRP_AFI(updgrp)),
+			   safi2str(UPDGRP_SAFI(updgrp)), ctx->walk.dest);
 
-		entry = XCALLOC(MTYPE_BGP_UPDGRP, sizeof(*entry));
-		entry->id = subgrp->id;
-		entry->peers = list_new();
-		SUBGRP_FOREACH_PEER (subgrp, paf) {
-			peer_lock(paf->peer);
-			listnode_add(entry->peers, paf->peer);
+	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
+		if (!ctx->subgroups) {
+			/* Fast path: process inline */
+			group_announce_route_subgroup(ctx, subgrp);
+			ctx->count++;
+			if (ctx->count > GROUP_ANNOUNCE_BATCH_SIZE) {
+				/* Switch to snapshot mode for remaining */
+				ctx->subgroups = list_new();
+			}
+		} else {
+			/* Snapshot mode: record for deferred processing */
+			if (subgrp->peer_count == 0)
+				continue;
+
+			entry = XCALLOC(MTYPE_BGP_UPDGRP, sizeof(*entry));
+			entry->id = subgrp->id;
+			entry->peers = list_new();
+			SUBGRP_FOREACH_PEER (subgrp, paf) {
+				peer_lock(paf->peer);
+				listnode_add(entry->peers, paf->peer);
+			}
+			listnode_add(ctx->subgroups, entry);
 		}
-		listnode_add(ctx->subgroups, entry);
 	}
 
 	return UPDWALK_CONTINUE;
@@ -521,19 +514,6 @@ static wq_item_status group_announce_queue_process(struct work_queue *wq,
 	}
 
 	return ctx->next ? WQ_REQUEUE : WQ_SUCCESS;
-}
-
-static void group_announce_process_snapshot(struct group_announce_context *ctx)
-{
-	struct group_announce_subgroup *entry;
-	struct update_subgroup *subgrp;
-	struct listnode *node;
-
-	for (ALL_LIST_ELEMENTS_RO(ctx->subgroups, node, entry)) {
-		subgrp = group_announce_find_subgroup(ctx, entry);
-		if (subgrp)
-			group_announce_route_subgroup(ctx, subgrp);
-	}
 }
 
 static void subgrp_show_adjq_vty(struct update_subgroup *subgrp,
@@ -1416,10 +1396,9 @@ void subgroup_announce_all(struct update_subgroup *subgrp)
 void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 			  struct bgp_dest *dest, struct bgp_path_info *pi)
 {
+	struct group_announce_context sync_ctx = {};
 	struct group_announce_context *ctx;
 	struct group_announce_generation *state;
-	struct group_announce_count count = {};
-	struct group_announce_context sync_ctx = {};
 	uint64_t generation;
 	char queue_name[BUFSIZ];
 
@@ -1428,24 +1407,30 @@ void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 	/* If suppress fib is enabled, the route will be advertised when
 	 * FIB status is received
 	 */
-	if (!bgp_check_advertise(bgp, dest, safi)) {
+	if (!bgp_check_advertise(bgp, dest, safi))
 		return;
-	}
 
-	update_group_af_walk(bgp, afi, safi, group_announce_route_count_cb,
-			     &count);
-	if (count.subgroups <= GROUP_ANNOUNCE_BATCH_SIZE) {
-		sync_ctx.walk.dest = dest;
-		sync_ctx.walk.pi = pi;
-		sync_ctx.afi = afi;
-		sync_ctx.safi = safi;
-		update_group_af_walk(bgp, afi, safi,
-				     group_announce_route_walkcb, &sync_ctx);
+	/*
+	 * Single walk: processes subgroups inline up to the batch
+	 * threshold, then switches to snapshot mode for the rest.
+	 * If all subgroups fit in one batch, we're done.
+	 */
+	sync_ctx.walk.dest = dest;
+	sync_ctx.walk.pi = pi;
+	sync_ctx.afi = afi;
+	sync_ctx.safi = safi;
+	update_group_af_walk(bgp, afi, safi,
+			     group_announce_route_walkcb, &sync_ctx);
+
+	/* Fast path completed everything inline */
+	if (!sync_ctx.subgroups)
 		return;
-	}
 
+	/* Remaining subgroups need deferred processing via work queue.
+	 * Move the snapshot into a heap-allocated context.
+	 */
 	state = group_announce_generation_get(bgp, dest, afi, safi,
-					     &generation);
+					      &generation);
 
 	ctx = XCALLOC(MTYPE_BGP_UPDGRP, sizeof(*ctx));
 	ctx->state = state;
@@ -1454,16 +1439,8 @@ void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 	ctx->safi = safi;
 	ctx->walk.dest = bgp_dest_lock_node(dest);
 	ctx->walk.pi = pi ? bgp_path_info_lock(pi) : NULL;
-	ctx->subgroups = list_new();
-	update_group_af_walk(bgp, afi, safi,
-			     group_announce_route_snapshot_cb, ctx);
+	ctx->subgroups = sync_ctx.subgroups;
 	ctx->next = listhead(ctx->subgroups);
-
-	if (listcount(ctx->subgroups) <= GROUP_ANNOUNCE_BATCH_SIZE) {
-		group_announce_process_snapshot(ctx);
-		group_announce_context_free(ctx);
-		return;
-	}
 
 	if (!bgp->fanout_queue) {
 		snprintf(queue_name, sizeof(queue_name), "fanout_queue %s",

@@ -434,6 +434,7 @@ extern void subgroup_default_originate(struct update_subgroup *subgrp,
 extern void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 				 struct bgp_dest *dest,
 				 struct bgp_path_info *pi);
+extern void bgp_fanout_generation_free(void *data);
 extern void subgroup_clear_table(struct update_subgroup *subgrp);
 extern void update_group_announce(struct bgp *bgp);
 extern void update_group_announce_rrclients(struct bgp *bgp);

@@ -4818,7 +4818,8 @@ void bgp_free(struct bgp *bgp)
 	bf_release_index(bm->rd_idspace, bgp->vrf_rd_id);
 
 	bgp_evpn_cleanup(bgp);
-	hash_clean_and_free(&bgp->fanout_generations, NULL);
+	hash_clean_and_free(&bgp->fanout_generations,
+			    bgp_fanout_generation_free);
 	bgp_pbr_cleanup(bgp);
 	bgp_ls_cleanup(bgp);
 	bgp_addpath_finish_bgp_data(&bgp->tx_addpath);
