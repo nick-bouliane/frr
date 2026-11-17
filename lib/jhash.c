@@ -11,6 +11,8 @@
 #include "zebra.h"
 #include "jhash.h"
 
+#include <string.h>
+
 #define XXH_PRIME32_1 0x9E3779B1U
 #define XXH_PRIME32_2 0x85EBCA77U
 #define XXH_PRIME32_3 0xC2B2AE3DU
