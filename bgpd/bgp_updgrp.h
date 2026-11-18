@@ -65,7 +65,11 @@
 	(PEER_CAP_ORF_PREFIX_SM_RCV | PEER_CAP_ADDPATH_AF_TX_ADV |             \
 	 PEER_CAP_ADDPATH_AF_RX_RCV | PEER_CAP_ENHE_AF_NEGO)
 
-enum bpacket_attr_vec_type { BGP_ATTR_VEC_NH = 0, BGP_ATTR_VEC_MAX };
+enum bpacket_attr_vec_type {
+	BGP_ATTR_VEC_NH = 0,
+	BGP_ATTR_VEC_MED,
+	BGP_ATTR_VEC_MAX
+};
 
 typedef struct {
 	uint32_t flags;
@@ -94,6 +98,16 @@ struct bpacket {
 
 	struct stream *buffer;
 	bpacket_attr_vec_arr arr;
+
+	/*
+	 * Fanout per-peer MED rewrite support.
+	 * When fanout_key_valid is set, the MED can be rewritten per-peer
+	 * in bpacket_reformat_for_peer() using the partial hash key.
+	 * The partial key is jhash(nexthop) — the peer address is mixed
+	 * in at reformat time to produce the final hash.
+	 */
+	bool fanout_key_valid;
+	uint32_t fanout_partial_key;
 
 	unsigned int ver;
 };

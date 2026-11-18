@@ -37,6 +37,7 @@
 #include "bgpd/bgp_packet.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_updgrp.h"
+#include "bgpd/bgp_fanout.h"
 #include "bgpd/bgp_nexthop.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_mplsvpn.h"
@@ -341,6 +342,25 @@ struct stream *bpacket_reformat_for_peer(struct bpacket *pkt,
 
 	s = stream_dup(pkt->buffer);
 	peer = PAF_PEER(paf);
+
+	/*
+	 * Per-peer MED rewrite for nexthop-fanout.
+	 * The partial hash key (nexthop only) was pre-computed at packet
+	 * build time.  Finalize with this peer's address and overwrite
+	 * the 4-byte MED value in the packet.
+	 */
+	if (pkt->fanout_key_valid) {
+		bpacket_attr_vec *med_vec =
+			&pkt->arr.entries[BGP_ATTR_VEC_MED];
+
+		if (CHECK_FLAG(med_vec->flags, BPKT_ATTRVEC_FLAGS_UPDATED)) {
+			uint32_t med = bgp_fanout_med_for_peer(
+				peer->bgp, peer, pkt->fanout_partial_key);
+
+			if (med != UINT32_MAX)
+				stream_putl_at(s, med_vec->offset, med);
+		}
+	}
 
 	vec = &pkt->arr.entries[BGP_ATTR_VEC_NH];
 
@@ -687,6 +707,8 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 	mpls_label_t labels[BGP_MAX_LABELS] = { MPLS_INVALID_LABEL };
 	uint8_t num_labels = 0;
 	struct bgp_ls_nlri *ls_nlri = NULL;
+	bool fanout_active = false;
+	struct attr *adv_attr = NULL;
 
 	if (!subgrp)
 		return NULL;
@@ -697,6 +719,10 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 	peer = SUBGRP_PEER(subgrp);
 	afi = SUBGRP_AFI(subgrp);
 	safi = SUBGRP_SAFI(subgrp);
+
+	if (SUBGRP_INST(subgrp)->fanout_cfg.enabled &&
+	    afi == AFI_L2VPN && safi == SAFI_EVPN)
+		fanout_active = true;
 	s = subgrp->work;
 	stream_reset(s);
 	snlri = subgrp->scratch;
@@ -884,6 +910,9 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 
 		num_pfx++;
 
+		if (fanout_active && !adv_attr)
+			adv_attr = adv->baa->attr;
+
 		if (bgp_debug_update(NULL, dest_p, subgrp->update_group, 0)) {
 			char pfx_buf[BGP_PRD_PATH_STRLEN];
 
@@ -954,6 +983,14 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 				 - stream_get_getp(packet)),
 				peer->max_packet_size, num_pfx);
 		pkt = bpacket_queue_add(SUBGRP_PKTQ(subgrp), packet, &vecarr);
+		if (fanout_active && adv_attr) {
+			uint32_t pkey = 0;
+
+			if (bgp_fanout_partial_key(adv_attr, &pkey)) {
+				pkt->fanout_key_valid = true;
+				pkt->fanout_partial_key = pkey;
+			}
+		}
 		stream_reset(s);
 		stream_reset(snlri);
 		return pkt;

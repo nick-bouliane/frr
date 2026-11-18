@@ -32,6 +32,7 @@
 #include "bgpd/bgp_ecommunity.h"
 #include "bgpd/bgp_lcommunity.h"
 #include "bgpd/bgp_updgrp.h"
+#include "bgpd/bgp_fanout.h"
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_mplsvpn.h"
 #include "bgpd/bgp_encap_types.h"
@@ -5626,10 +5627,15 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 	}
 
 	/* MED attribute. */
-	if (bgp_attr_exists(attr, BGP_ATTR_MULTI_EXIT_DISC) || bgp->maxmed_active) {
+	if (bgp_attr_exists(attr, BGP_ATTR_MULTI_EXIT_DISC) ||
+	    bgp->maxmed_active ||
+	    (afi == AFI_L2VPN && safi == SAFI_EVPN &&
+	     bgp_fanout_is_target_peer(bgp, peer))) {
 		stream_putc(s, BGP_ATTR_FLAG_OPTIONAL);
 		stream_putc(s, BGP_ATTR_MULTI_EXIT_DISC);
 		stream_putc(s, 4);
+		bpacket_attr_vec_arr_set_vec(vecarr, BGP_ATTR_VEC_MED, s,
+					     NULL);
 		stream_putl(s, (bgp->maxmed_active ? bgp->maxmed_value
 						   : attr->med));
 	}

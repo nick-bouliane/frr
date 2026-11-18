@@ -65,6 +65,7 @@
 #include "bgpd/bgp_addpath.h"
 #include "bgpd/bgp_mac.h"
 #include "bgpd/bgp_flowspec.h"
+#include "bgpd/bgp_fanout.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
 #ifdef ENABLE_BGP_VNC
@@ -21869,8 +21870,10 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 	bgp_config_write_maxpaths(vty, bgp, afi, safi);
 	bgp_config_write_table_map(vty, bgp, afi, safi);
 
-	if (safi == SAFI_EVPN)
+	if (safi == SAFI_EVPN) {
 		bgp_config_write_evpn_info(vty, bgp, afi, safi);
+		bgp_fanout_config_write(bgp, vty);
+	}
 
 	if (safi == SAFI_FLOWSPEC)
 		bgp_fs_config_write_pbr(vty, bgp, afi, safi);
