@@ -643,15 +643,24 @@ struct stream *bpacket_reformat_for_peer(struct bpacket *pkt,
  * to each offset.
  */
 static void bpacket_attr_vec_arr_update(struct bpacket_attr_vec_arr *vecarr,
-					size_t pos)
+						size_t mpattr_pos,
+						size_t mpattr_len)
 {
 	int i;
 
 	if (!vecarr)
 		return;
 
-	for (i = 0; i < BGP_ATTR_VEC_MAX; i++)
-		vecarr->entries[i].offset += pos;
+	for (i = 0; i < BGP_ATTR_VEC_MAX; i++) {
+		if (!CHECK_FLAG(vecarr->entries[i].flags,
+				BPKT_ATTRVEC_FLAGS_UPDATED))
+			continue;
+
+		if (i == BGP_ATTR_VEC_NH)
+			vecarr->entries[i].offset += mpattr_pos;
+		else
+			vecarr->entries[i].offset += mpattr_len;
+	}
 }
 
 /*
@@ -970,7 +979,8 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 
 		if (!stream_empty(snlri)) {
 			packet = stream_dupcat(s, snlri, mpattr_pos);
-			bpacket_attr_vec_arr_update(&vecarr, mpattr_pos);
+			bpacket_attr_vec_arr_update(&vecarr, mpattr_pos,
+						    stream_get_endp(snlri));
 		} else
 			packet = stream_dup(s);
 		bgp_packet_set_size(packet);
